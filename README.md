@@ -52,8 +52,14 @@ built web app and API from one Railway service:
 - Set the start command to `npm start --prefix backend`.
 - Keep the health check path `/api/health`.
 - Set `MYSQL_URL` to a Railway MySQL service variable reference, and set
-  `APP_URL` to the public HTTPS origin. Add optional mail and Google Maps
-  variables in Railway's service Variables.
+  `APP_URL` to the public HTTPS frontend origin. Railway Free, Trial, and Hobby
+  plans disable outbound SMTP, so configure a transactional email HTTPS API.
+  Resend is supported with `RESEND_API_KEY` and `RESEND_FROM_EMAIL`; verify the
+  sender domain with Resend before sending to users. SMTP is also supported on
+  platforms/plans that permit outbound SMTP by setting `SMTP_HOST`,
+  `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM`. For local testing
+  without email delivery, set `EXPOSE_RESET_TOKEN=true` outside production; the
+  login page will show a one-time reset link. Never enable this in production.
 
 Do not deploy with `backend/` as Railway's Root Directory for this combined
 setup: the backend serves the built assets from its sibling `frontend/`
@@ -133,8 +139,12 @@ npm run migrate:ml
 ```
 
 For a new database, `schema.sql` already includes the ML tables and columns.
-Historical weekly averages in reports are calculated from sensor readings;
-forecasts are shown separately as predicted future values.
+Daily and weekly report summaries are calculated by the authenticated
+`GET /api/reports/readings?from=<ISO timestamp>&to=<ISO timestamp>` endpoint
+from all stored sensor readings in the requested half-open time range. It
+returns per-pond averages, minima, maxima, sample counts, and out-of-normal
+readings; forecasts are shown separately as predicted future values. The
+frontend displays no-data values when a pond has no measurements in the range.
 
 
 ## ML analytics and existing databases

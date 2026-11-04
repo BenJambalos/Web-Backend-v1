@@ -7,7 +7,7 @@ import express from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
 import { pool, withTransaction } from "./db.js";
-import { createTransport } from "./mail.js";
+import { sendPasswordResetEmail } from "./mail.js";
 import cors from "cors";
 
 const allowedOrigins = (
@@ -138,15 +138,20 @@ app.post("/api/auth/password",requireAuth,async(req,res,next)=>{
 app.post("/api/auth/forgot-password",resetLimiter,async(req,res,next)=>{
   try{
     const email=normalizeEmail(req.body.email);
+    const exposeResetToken=process.env.NODE_ENV!=="production"&&process.env.EXPOSE_RESET_TOKEN==="true";
+    const resetUrl=new URL("/reset-password",process.env.APP_URL||"http://localhost:5173");
+    if(!["http:","https:"].includes(resetUrl.protocol)) {
+      throw httpError(503,"APP_URL must use HTTP or HTTPS.");
+    }
     const {rows}=await pool.query("SELECT a.account_id,p.email FROM accounts a JOIN user_profiles p ON p.account_id=a.account_id WHERE LOWER(p.email)=?",[email]);
     if(rows[0]){
       const token=crypto.randomBytes(32).toString("hex");
       await pool.query("INSERT INTO password_resets (account_id,token,expires_at) VALUES (?,?,DATE_ADD(NOW(),INTERVAL 1 HOUR))",[rows[0].account_id,token]);
-      if(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS && process.env.SMTP_FROM) {
-        const { transport, from } = createTransport();
-        await transport.sendMail({ from, to: email, subject: "HyQual password reset", text: `Use this reset token in HyQual: ${token}\nThis token expires in one hour.` });
+      resetUrl.searchParams.set("token",token);
+      if(!exposeResetToken) {
+        await sendPasswordResetEmail(rows[0].email,resetUrl.toString());
       }
-      if(process.env.NODE_ENV!=="production") res.json({message:"If the account exists, reset instructions have been prepared.",...(process.env.EXPOSE_RESET_TOKEN==="true"?{token}:{})});
+      if(process.env.NODE_ENV!=="production") res.json({message:"If the account exists, reset instructions have been prepared.",...(exposeResetToken?{token}:{})});
       else res.json({message:"If the account exists, reset instructions have been sent."});
     }else res.json({message:"If the account exists, reset instructions have been sent."});
   }catch(e){next(e);}
@@ -440,6 +445,64 @@ app.get("/api/device/readings/:parameter",requireAuth,async(req,res,next)=>{
    values,
   );
   res.json(rows.reverse().map(r=>({id:r.reading_id,deviceId:r.device_id,pondId:r.pond_id,parameter:req.params.parameter,value:Number(r.value),createdAt:new Date(r.recorded_at).toISOString()})));
+ }catch(e){next(e);}
+});
+app.get("/api/reports/readings",requireAuth,async(req,res,next)=>{
+ try{
+  const from=typeof req.query.from==="string"?new Date(req.query.from):null;
+  const to=typeof req.query.to==="string"?new Date(req.query.to):null;
+  if(!from||!to||!Number.isFinite(from.getTime())||!Number.isFinite(to.getTime())||from>=to){
+   throw httpError(400,"Valid from and to timestamps are required.");
+  }
+  if(to-from>8*24*60*60*1000)throw httpError(400,"Report period cannot exceed eight days.");
+  const {rows}=await pool.query(
+   `SELECT pond_id,
+     AVG(temperature) AS temperature_average,MIN(temperature) AS temperature_min,MAX(temperature) AS temperature_max,COUNT(temperature) AS temperature_count,
+     AVG(ph_level) AS ph_average,MIN(ph_level) AS ph_min,MAX(ph_level) AS ph_max,COUNT(ph_level) AS ph_count,
+     AVG(dissolved_oxygen) AS dissolved_oxygen_average,MIN(dissolved_oxygen) AS dissolved_oxygen_min,MAX(dissolved_oxygen) AS dissolved_oxygen_max,COUNT(dissolved_oxygen) AS dissolved_oxygen_count,
+     AVG(salinity) AS salinity_average,MIN(salinity) AS salinity_min,MAX(salinity) AS salinity_max,COUNT(salinity) AS salinity_count
+    FROM water_quality_readings
+    WHERE recorded_at>=? AND recorded_at<?
+    GROUP BY pond_id`,
+   [from,to],
+  );
+  const incidents=await pool.query(
+   `SELECT pond_id,'temperature' AS parameter,temperature AS value,recorded_at FROM water_quality_readings
+      WHERE recorded_at>=? AND recorded_at<? AND temperature IS NOT NULL AND (temperature<26 OR temperature>32)
+    UNION ALL
+    SELECT pond_id,'ph' AS parameter,ph_level AS value,recorded_at FROM water_quality_readings
+      WHERE recorded_at>=? AND recorded_at<? AND ph_level IS NOT NULL AND (ph_level<7.5 OR ph_level>8.5)
+    UNION ALL
+    SELECT pond_id,'dissolved_oxygen' AS parameter,dissolved_oxygen AS value,recorded_at FROM water_quality_readings
+      WHERE recorded_at>=? AND recorded_at<? AND dissolved_oxygen IS NOT NULL AND dissolved_oxygen<5
+    UNION ALL
+    SELECT pond_id,'salinity' AS parameter,salinity AS value,recorded_at FROM water_quality_readings
+      WHERE recorded_at>=? AND recorded_at<? AND salinity IS NOT NULL AND (salinity<10 OR salinity>25)
+    ORDER BY recorded_at`,
+   [from,to,from,to,from,to,from,to],
+  );
+  const numeric=(value)=>value==null?null:Number(value);
+  const metric=(row,key)=>({
+   average:numeric(row[`${key}_average`]),
+   min:numeric(row[`${key}_min`]),
+   max:numeric(row[`${key}_max`]),
+   count:Number(row[`${key}_count`]),
+  });
+  res.json({
+   ponds:rows.map(row=>({
+    pondId:String(row.pond_id),
+    temperature:metric(row,"temperature"),
+    ph:metric(row,"ph"),
+    dissolvedOxygen:metric(row,"dissolved_oxygen"),
+    salinity:metric(row,"salinity"),
+   })),
+   incidents:incidents.rows.map(row=>({
+    pondId:String(row.pond_id),
+    parameter:row.parameter,
+    value:Number(row.value),
+    recordedAt:new Date(row.recorded_at).toISOString(),
+   })),
+  });
  }catch(e){next(e);}
 });
 app.use("/api",(req,res,next)=>next(httpError(404,"API route not found.")));
