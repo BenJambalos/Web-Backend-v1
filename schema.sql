@@ -84,6 +84,22 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------
+-- addresses  USER-ENTERED CONTACT ADDRESSES
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS addresses (
+  address_id  INT AUTO_INCREMENT PRIMARY KEY,
+  user_id     INT NOT NULL,
+  street      VARCHAR(255) NOT NULL,
+  barangay    VARCHAR(100) NOT NULL,
+  city        VARCHAR(100) NOT NULL,
+  created_at  TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY fk_addresses_user (user_id),
+  CONSTRAINT fk_addresses_user FOREIGN KEY (user_id)
+    REFERENCES user_profiles (user_id) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------
 -- aquaculture_farms  (unchanged from your ERD)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS aquaculture_farms (

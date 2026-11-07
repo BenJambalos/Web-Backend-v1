@@ -66,13 +66,15 @@ async function requireAuth(req, res, next) {
   try {
     const id = readSession(req.cookies[COOKIE]);
     if (!id) throw httpError(401, "Authentication required.");
-    const { rows } = await pool.query(`SELECT a.*, p.first_name, p.middle_name, p.last_name, p.email, p.phone
-      FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id WHERE a.account_id=?`, [id]);
+    const { rows } = await pool.query(`SELECT a.*, p.first_name, p.middle_name, p.last_name, p.email, p.phone,
+      ad.street, ad.barangay, ad.city
+      FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
+      ${PROFILE_ADDRESS_JOIN} WHERE a.account_id=?`, [id]);
     if (!rows[0]) throw httpError(401, "Authentication required.");
     const row = rows[0];
     if (row.status !== "active") throw httpError(403, row.status === "pending" ? "Your account is still pending approval." : "This account is not active.");
     req.account = row;
-    req.user = makeUser(row, { firstName: row.first_name, middleName: row.middle_name, lastName: row.last_name, email: row.email, phone: row.phone, mobile: row.phone, role: roleName(row.role) });
+    req.user = makeUser(row, { ...camelProfile(row), mobile: row.phone, role: roleName(row.role) });
     next();
   } catch (e) { next(e); }
 }
@@ -85,10 +87,67 @@ function normalizeEmail(value) {
   return value.trim().toLowerCase();
 }
 function camelProfile(row) {
-  return { firstName: row.first_name, middleName: row.middle_name, lastName: row.last_name, email: row.email, phone: row.phone };
+  return {
+    firstName: row.first_name,
+    middleName: row.middle_name,
+    lastName: row.last_name,
+    email: row.email,
+    phone: row.phone,
+    street: row.street,
+    barangay: row.barangay,
+    city: row.city,
+  };
 }
-async function audit(accountId, type, description) {
-  await pool.query("INSERT INTO activity_logs (account_id, action_type, action_description) VALUES (?, ?, ?)", [accountId, type, description || null]);
+const PROFILE_ADDRESS_JOIN = `LEFT JOIN (
+  SELECT user_id, MAX(address_id) AS address_id
+  FROM addresses
+  GROUP BY user_id
+) latest_address ON latest_address.user_id=p.user_id
+LEFT JOIN addresses ad ON ad.address_id=latest_address.address_id`;
+function getAddressInput(body) {
+  const fields = ["street", "barangay", "city"];
+  if (!fields.some((field) => body[field] !== undefined)) return null;
+
+  const address = Object.fromEntries(fields.map((field) => [
+    field,
+    typeof body[field] === "string" ? body[field].trim() : "",
+  ]));
+  if (fields.every((field) => !address[field])) return address;
+  if (fields.some((field) => !address[field])) {
+    throw httpError(400, "Street, barangay, and city are all required to save an address.");
+  }
+  return address;
+}
+async function saveUserAddress(client, profileUserId, address) {
+  if (!address) return false;
+  if (!profileUserId) throw new Error("Cannot save user address without a profile user ID.");
+  const { rows } = await client.query(
+    "SELECT address_id,street,barangay,city FROM addresses WHERE user_id=? ORDER BY address_id DESC LIMIT 1 FOR UPDATE",
+    [profileUserId],
+  );
+  const current = rows[0];
+  if (Object.values(address).every((value) => !value)) {
+    if (current) await client.query("DELETE FROM addresses WHERE user_id=?", [profileUserId]);
+    return Boolean(current);
+  }
+  if (current) {
+    if (current.street === address.street
+      && current.barangay === address.barangay
+      && current.city === address.city) return false;
+    await client.query(
+      "UPDATE addresses SET street=?,barangay=?,city=? WHERE address_id=?",
+      [address.street, address.barangay, address.city, current.address_id],
+    );
+  } else {
+    await client.query(
+      "INSERT INTO addresses(user_id,street,barangay,city) VALUES(?,?,?,?)",
+      [profileUserId, address.street, address.barangay, address.city],
+    );
+  }
+  return true;
+}
+async function audit(accountId, type, description, client = pool) {
+  await client.query("INSERT INTO activity_logs (account_id, action_type, action_description) VALUES (?, ?, ?)", [accountId, type, description || null]);
 }
 const loginLimiter = rateLimit({ windowMs: 15*60*1000, limit: 10, standardHeaders: "draft-8", legacyHeaders: false });
 const resetLimiter = rateLimit({ windowMs: 60*60*1000, limit: 5, standardHeaders: "draft-8", legacyHeaders: false });
@@ -98,8 +157,10 @@ app.get("/api/health", async (_req,res,next)=>{ try { await pool.query("SELECT 1
 app.post("/api/auth/login", loginLimiter, async (req,res,next)=>{
   try {
     const identifier = String(req.body.email || req.body.username || "").trim().toLowerCase();
-    const {rows}=await pool.query(`SELECT a.*, p.first_name,p.middle_name,p.last_name,p.email,p.phone
+    const {rows}=await pool.query(`SELECT a.*, p.first_name,p.middle_name,p.last_name,p.email,p.phone,
+      ad.street,ad.barangay,ad.city
       FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
+      ${PROFILE_ADDRESS_JOIN}
       WHERE LOWER(a.username)=? OR LOWER(p.email)=? LIMIT 1`,[identifier,identifier]);
     const row=rows[0];
     if(!row?.password_hash || !(await bcrypt.compare(req.body.password || "",row.password_hash))) throw httpError(401,"Invalid username/email or password.");
@@ -169,51 +230,84 @@ app.post("/api/auth/reset-password",async(req,res,next)=>{
 
 app.get("/api/users",requireAuth,requireSuperadmin,async(_req,res,next)=>{
  try{
-  const {rows}=await pool.query(`SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone
-    FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id ORDER BY a.created_at DESC LIMIT 5000`);
+  const {rows}=await pool.query(`SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone,
+    ad.street,ad.barangay,ad.city
+    FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
+    ${PROFILE_ADDRESS_JOIN} ORDER BY a.created_at DESC LIMIT 5000`);
   res.json(rows.map(r=>makeUser(r,camelProfile(r))));
  }catch(e){next(e);}
 });
 app.post("/api/users",requireAuth,requireSuperadmin,async(req,res,next)=>{
  try{
   const username=String(req.body.username||req.body.email||"").trim().toLowerCase(), email=normalizeEmail(req.body.email);
+  const address=getAddressInput(req.body);
   if(!req.body.password||req.body.password.length<6) throw httpError(400,"Password must be at least 6 characters.");
   const role=({ "Superadmin":"super_admin","BFAR Admin":"admin","Farm Owner":"farm_owner",super_admin:"super_admin",admin:"admin",farm_owner:"farm_owner"})[req.body.role]||"farm_owner";
   const status=({Active:"active",Pending:"pending",Inactive:"disabled",Rejected:"rejected",active:"active",pending:"pending",disabled:"disabled",rejected:"rejected"})[req.body.status]||"active";
-  const id=await withTransaction(async c=>{const a=await c.query("INSERT INTO accounts(username,password_hash,role,status) VALUES(?,?,?,?)",[username,await bcrypt.hash(req.body.password,10),role,status]);await c.query("INSERT INTO user_profiles(account_id,first_name,middle_name,last_name,email,phone) VALUES(?,?,?,?,?,?)",[a.insertId,req.body.firstName||"",req.body.middleName||null,req.body.lastName||"",email,req.body.phone||req.body.mobile||null]);return a.insertId;});
+  const id=await withTransaction(async c=>{
+   const a=await c.query("INSERT INTO accounts(username,password_hash,role,status) VALUES(?,?,?,?)",[username,await bcrypt.hash(req.body.password,10),role,status]);
+   const profile=await c.query("INSERT INTO user_profiles(account_id,first_name,middle_name,last_name,email,phone) VALUES(?,?,?,?,?,?)",[a.insertId,req.body.firstName||"",req.body.middleName||null,req.body.lastName||"",email,req.body.phone||req.body.mobile||null]);
+   await saveUserAddress(c,profile.insertId,address);
+   return a.insertId;
+  });
   res.status(201).json({id:String(id)});
  }catch(e){next(e);}
 });
 app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
  try{
   const id=Number(req.params.id);
+  const address=getAddressInput(req.body);
+  if(address && req.account.role!=="super_admin") {
+   throw httpError(403,"Only a superadmin may update a user's address.");
+  }
   if(req.account.role!=="super_admin"&&id!==req.account.account_id) throw httpError(403,"You may only update your own profile.");
   if(req.body.email!==undefined && id===req.account.account_id) {
    throw httpError(403,"You cannot change your own email address.");
   }
-  if(req.account.role==="super_admin"){
-   const map={Active:"active",Pending:"pending",Inactive:"inactive",Suspended:"suspended",Rejected:"rejected",active:"active",inactive:"inactive",disabled:"disabled",suspended:"suspended",rejected:"rejected"};
-   if(req.body.status === "archived" || req.body.archived === true) {
-    await pool.query(
-      "UPDATE accounts SET status_before_archive=IF(status='archived',status_before_archive,status), status='archived' WHERE account_id=?",
-      [id],
-    );
-   } else if(req.body.archived === false) {
-    await pool.query(
-      "UPDATE accounts SET status=COALESCE(status_before_archive,'active'), status_before_archive=NULL WHERE account_id=? AND status='archived'",
-      [id],
-    );
-   } else if(req.body.status) {
-    await pool.query("UPDATE accounts SET status=? WHERE account_id=?",[map[req.body.status]||req.body.status,id]);
+  const updated=await withTransaction(async c=>{
+   const {rows}=await c.query(`SELECT a.*,p.user_id,p.first_name,p.middle_name,p.last_name,p.email,p.phone
+    FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
+    WHERE a.account_id=? FOR UPDATE`,[id]);
+   if(!rows[0]) throw httpError(404,"User not found.");
+   if(req.account.role==="super_admin"){
+    const map={Active:"active",Pending:"pending",Inactive:"inactive",Suspended:"suspended",Rejected:"rejected",active:"active",inactive:"inactive",disabled:"disabled",suspended:"suspended",rejected:"rejected"};
+    if(req.body.status==="archived"||req.body.archived===true){
+     await c.query("UPDATE accounts SET status_before_archive=IF(status='archived',status_before_archive,status),status='archived' WHERE account_id=?",[id]);
+    }else if(req.body.archived===false){
+     await c.query("UPDATE accounts SET status=COALESCE(status_before_archive,'active'),status_before_archive=NULL WHERE account_id=? AND status='archived'",[id]);
+    }else if(req.body.status){
+     await c.query("UPDATE accounts SET status=? WHERE account_id=?",[map[req.body.status]||req.body.status,id]);
+    }
+    if(req.body.role){
+     const roles={"Farm Owner":"farm_owner","BFAR Admin":"admin","Superadmin":"super_admin"};
+     await c.query("UPDATE accounts SET role=? WHERE account_id=?",[roles[req.body.role]||req.body.role,id]);
+    }
    }
-   if(req.body.role){const roles={"Farm Owner":"farm_owner","BFAR Admin":"admin","Superadmin":"super_admin"};await pool.query("UPDATE accounts SET role=? WHERE account_id=?",[roles[req.body.role]||req.body.role,id]);}
-  }
-  const fields={firstName:"first_name",middleName:"middle_name",lastName:"last_name",phone:"phone",mobile:"phone"};
-  for(const [k,col] of Object.entries(fields)) if(req.body[k]!==undefined) await pool.query(`UPDATE user_profiles SET ${col}=? WHERE account_id=?`,[req.body[k]||null,id]);
-  if(req.body.email!==undefined) await pool.query("UPDATE user_profiles SET email=? WHERE account_id=?",[normalizeEmail(req.body.email),id]);
-  const {rows}=await pool.query("SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id WHERE a.account_id=?",[id]);
-  if(!rows[0]) throw httpError(404,"User not found.");
-  res.json(makeUser(rows[0],camelProfile(rows[0])));
+   const updates=new Map();
+   const fields={firstName:"first_name",middleName:"middle_name",lastName:"last_name",phone:"phone",mobile:"phone"};
+   for(const [key,column] of Object.entries(fields)){
+    if(req.body[key]!==undefined) updates.set(column,req.body[key]||null);
+   }
+   if(req.body.email!==undefined) updates.set("email",normalizeEmail(req.body.email));
+   const changedFields=[];
+   const labels={first_name:"first name",middle_name:"middle name",last_name:"last name",phone:"mobile number",email:"email"};
+   for(const [column,value] of updates){
+    if(String(rows[0][column]??"")===String(value??"")) continue;
+    await c.query(`UPDATE user_profiles SET ${column}=? WHERE account_id=?`,[value,id]);
+    changedFields.push(labels[column]);
+   }
+   if(await saveUserAddress(c,rows[0].user_id,address)) changedFields.push("address");
+   if(changedFields.length){
+    const target=id===req.account.account_id?"own profile":`profile for account #${id}`;
+    await audit(req.account.account_id,"profile_updated",`Edited ${target}; changed ${changedFields.join(", ")}.`,c);
+   }
+   const {rows:updatedRows}=await c.query(`SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone,
+    ad.street,ad.barangay,ad.city
+    FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
+    ${PROFILE_ADDRESS_JOIN} WHERE a.account_id=?`,[id]);
+   return updatedRows[0];
+  });
+  res.json(makeUser(updated,camelProfile(updated)));
  }catch(e){next(e);}
 });
 app.delete("/api/users/:id",requireAuth,requireSuperadmin,async(req,res,next)=>{
@@ -225,7 +319,10 @@ app.post("/api/approvals/:id/reject",requireAuth,requireSuperadmin,async(req,res
 async function collectionData(name){
  if(name==="directory"||name==="approvals"){
   const where=name==="approvals"?"WHERE a.status IN ('pending','rejected')":"";
-  const {rows}=await pool.query(`SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id ${where} ORDER BY a.created_at DESC LIMIT 5000`);
+  const {rows}=await pool.query(`SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone,
+   ad.street,ad.barangay,ad.city
+   FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
+   ${PROFILE_ADDRESS_JOIN} ${where} ORDER BY a.created_at DESC LIMIT 5000`);
   return rows.map(r=>makeUser(r,camelProfile(r)));
  }
  if(name==="farms"){
@@ -233,8 +330,29 @@ async function collectionData(name){
   return rows.map(r=>({id:String(r.farm_id),farmId:r.farm_id,farmName:r.farm_name,name:r.farm_name,ownerId:String(r.owner_id),owner:[r.first_name,r.last_name].filter(Boolean).join(" "),location:r.location||[r.street,r.barangay,r.municipality,r.province].filter(Boolean).join(", "),street:r.street,barangay:r.barangay,city:r.municipality,province:r.province,zip:r.zip_code,createdAt:r.created_at,updatedAt:r.updated_at}));
  }
  if(name==="ponds"){
-  const {rows}=await pool.query(`SELECT p.*, (SELECT JSON_OBJECT('temperature',w.temperature,'phLevel',w.ph_level,'dissolvedOxygen',w.dissolved_oxygen,'salinity',w.salinity,'recordedAt',w.recorded_at) FROM water_quality_readings w WHERE w.pond_id=p.pond_id ORDER BY w.recorded_at DESC LIMIT 1) latest FROM ponds p ORDER BY p.pond_id`);
-  return rows.map(r=>({id:String(r.pond_id),pondId:r.pond_id,farmId:String(r.farm_id),pondName:r.pond_name,name:r.pond_name,volume:r.volume,latestReading:typeof r.latest==="string"?JSON.parse(r.latest):r.latest}));
+  const {rows}=await pool.query(`SELECT p.*,
+    (SELECT JSON_OBJECT('temperature',w.temperature,'phLevel',w.ph_level,'dissolvedOxygen',w.dissolved_oxygen,'salinity',w.salinity,'recordedAt',w.recorded_at)
+     FROM water_quality_readings w WHERE w.pond_id=p.pond_id ORDER BY w.recorded_at DESC LIMIT 1) latest,
+    (SELECT COUNT(*) FROM monitoring_devices d WHERE d.pond_id=p.pond_id AND d.status='active') active_device_count,
+    (SELECT COUNT(*) FROM monitoring_devices d
+     LEFT JOIN device_status s ON s.device_id=d.device_id
+     WHERE d.pond_id=p.pond_id AND d.status='active'
+       AND (
+         (s.connectivity_status IN ('online','weak')
+           AND s.last_seen_at >= CURRENT_TIMESTAMP - INTERVAL 5 MINUTE)
+         OR EXISTS (
+           SELECT 1 FROM water_quality_readings w
+           WHERE w.pond_id=p.pond_id
+             AND w.recorded_at >= CURRENT_TIMESTAMP - INTERVAL 5 MINUTE
+         )
+       )) online_device_count
+    FROM ponds p ORDER BY p.pond_id`);
+  return rows.map(r=>({
+   id:String(r.pond_id),pondId:r.pond_id,farmId:String(r.farm_id),pondName:r.pond_name,name:r.pond_name,volume:r.volume,
+   latestReading:typeof r.latest==="string"?JSON.parse(r.latest):r.latest,
+   registeredDevice:Number(r.active_device_count)>0,
+   deviceOnline:Number(r.online_device_count)>0,
+  }));
  }
  if(name==="devices"){
   const {rows}=await pool.query(`SELECT d.*,s.battery_percentage,s.is_charging,s.connectivity_status,s.signal_strength,s.active_sensors_count,s.recorded_at,s.last_seen_at FROM monitoring_devices d LEFT JOIN device_status s ON s.device_id=d.device_id ORDER BY d.device_id`);
@@ -245,8 +363,8 @@ async function collectionData(name){
   return rows.map(r=>({id:String(r.notification_id),notificationId:r.notification_id,farmId:String(r.farm_id),pondId:r.pond_id==null?null:String(r.pond_id),deviceId:r.device_id==null?null:String(r.device_id),parameter:r.parameter,title:r.title,alertLevel:r.alert_level,status:r.alert_level,alertMessage:r.alert_message,message:r.alert_message,recommendedAction:r.recommended_action,estimatedArrivalTime:r.estimated_arrival_time,isResolved:!!r.is_resolved,isRead:!!r.is_read,createdAt:r.created_at}));
  }
  if(name==="auditLogs"){
-  const {rows}=await pool.query("SELECT l.*,a.username,p.first_name,p.last_name FROM activity_logs l JOIN accounts a ON a.account_id=l.account_id LEFT JOIN user_profiles p ON p.account_id=a.account_id ORDER BY l.logged_at DESC LIMIT 5000");
-  return rows.map(r=>({id:String(r.log_id),actorId:String(r.account_id),actor:[r.first_name,r.last_name].filter(Boolean).join(" ")||r.username,actorRole:"",type:r.action_type,action:r.action_type,detail:r.action_description,createdAt:r.logged_at}));
+  const {rows}=await pool.query("SELECT l.*,a.username,a.role,p.first_name,p.last_name FROM activity_logs l JOIN accounts a ON a.account_id=l.account_id LEFT JOIN user_profiles p ON p.account_id=a.account_id ORDER BY l.logged_at DESC LIMIT 5000");
+  return rows.map(r=>({id:String(r.log_id),actorId:String(r.account_id),actor:[r.first_name,r.last_name].filter(Boolean).join(" ")||r.username,actorRole:roleName(r.role),type:r.action_type,action:r.action_type,detail:r.action_description,createdAt:r.logged_at}));
  }
  throw httpError(404,"Collection not found.");
 }
@@ -277,13 +395,55 @@ app.post("/api/collections/:collection",requireAuth,requireSuperadmin,async(req,
   throw httpError(403,"This collection cannot be created through this API.");
  }catch(e){next(e);}
 });
-app.patch("/api/collections/:collection/:id",requireAuth,requireSuperadmin,async(req,res,next)=>{
+app.patch("/api/collections/:collection/:id",requireAuth,async(req,res,next)=>{
  try{
   const n=req.params.collection,id=Number(req.params.id),b=req.body;
-  if(n==="farms"){const fields={farmName:"farm_name",name:"farm_name",ownerId:"owner_id",street:"street",barangay:"barangay",city:"municipality",municipality:"municipality",province:"province",zip:"zip_code",location:"location"};for(const[k,col]of Object.entries(fields))if(b[k]!==undefined)await pool.query(`UPDATE aquaculture_farms SET ${col}=? WHERE farm_id=?`,[b[k],id]);}
-  else if(n==="ponds"){if(b.pondName!==undefined||b.name!==undefined)await pool.query("UPDATE ponds SET pond_name=? WHERE pond_id=?",[b.pondName||b.name,id]);if(b.farmId!==undefined)await pool.query("UPDATE ponds SET farm_id=? WHERE pond_id=?",[Number(b.farmId),id]);if(b.volume!==undefined)await pool.query("UPDATE ponds SET volume=? WHERE pond_id=?",[b.volume,id]);}
-  else if(n==="devices"){const fields={deviceName:"device_name",status:"status",farmId:"farm_id",pondId:"pond_id"};for(const[k,col]of Object.entries(fields))if(b[k]!==undefined)await pool.query(`UPDATE monitoring_devices SET ${col}=? WHERE device_id=?`,[b[k]===""?null:b[k],id]);}
-  else if(n==="alerts"){const fields={title:"title",alertLevel:"alert_level",alertMessage:"alert_message",recommendedAction:"recommended_action",isResolved:"is_resolved",isRead:"is_read"};for(const[k,col]of Object.entries(fields))if(b[k]!==undefined)await pool.query(`UPDATE early_warning_notifications SET ${col}=? WHERE notification_id=?`,[b[k],id]);}
+  if(n==="farms"||n==="ponds"){
+   await withTransaction(async c=>{
+    const isFarm=n==="farms";
+    const table=isFarm?"aquaculture_farms":"ponds";
+    const idColumn=isFarm?"farm_id":"pond_id";
+    const {rows}=await c.query(
+     isFarm
+      ?"SELECT farm_id,owner_id,farm_name,street,barangay,municipality,province,zip_code,location FROM aquaculture_farms WHERE farm_id=? FOR UPDATE"
+      :"SELECT p.pond_id,p.farm_id,p.pond_name,p.volume,f.owner_id FROM ponds p JOIN aquaculture_farms f ON f.farm_id=p.farm_id WHERE p.pond_id=? FOR UPDATE",
+     [id],
+    );
+    const current=rows[0];
+    if(!current) throw httpError(404,isFarm?"Farm not found.":"Pond not found.");
+    const isOwner=req.account.role==="farm_owner"&&Number(current.owner_id)===req.account.account_id;
+    if(req.account.role!=="super_admin"&&!isOwner) throw httpError(403,"You may only edit a farm or pond that you own.");
+    const fields=isFarm
+     ?{farmName:"farm_name",name:"farm_name",ownerId:"owner_id",street:"street",barangay:"barangay",city:"municipality",municipality:"municipality",province:"province",zip:"zip_code",location:"location"}
+     :{pondName:"pond_name",name:"pond_name",farmId:"farm_id",volume:"volume"};
+    const updates=new Map();
+    for(const [key,column] of Object.entries(fields)){
+     if(b[key]!==undefined) updates.set(column,b[key]);
+    }
+    if(isOwner&&[...updates.keys()].some((column)=>column!==(isFarm?"farm_name":"pond_name"))){
+     throw httpError(403,"Farm owners may only edit farm and pond names.");
+    }
+    const labels=isFarm
+     ?{farm_name:"farm name",owner_id:"owner",street:"street",barangay:"barangay",municipality:"municipality",province:"province",zip_code:"ZIP code",location:"location"}
+     :{pond_name:"pond name",farm_id:"farm",volume:"volume"};
+    const changedFields=[];
+    for(const [column,value] of updates){
+     const normalizedValue=column==="owner_id"||column==="farm_id" ? Number(value) : value;
+     const isSameVolume=column==="volume"
+      && ((current.volume==null&&normalizedValue==null)
+       ||(current.volume!=null&&normalizedValue!=null&&Number(current.volume)===Number(normalizedValue)));
+     if(isSameVolume||String(current[column]??"")===String(normalizedValue??"")) continue;
+     await c.query(`UPDATE ${table} SET ${column}=? WHERE ${idColumn}=?`,[normalizedValue,id]);
+     changedFields.push(labels[column]);
+    }
+    if(changedFields.length){
+     const entity=isFarm?`farm #${id}`:`pond #${id}`;
+     await audit(req.account.account_id,isFarm?"farm_updated":"pond_updated",`Edited ${entity}; changed ${changedFields.join(", ")}.`,c);
+    }
+   });
+  }
+  else if(n==="devices"){if(req.account.role!=="super_admin")throw httpError(403,"Superadmin access is required.");const fields={deviceName:"device_name",status:"status",farmId:"farm_id",pondId:"pond_id"};for(const[k,col]of Object.entries(fields))if(b[k]!==undefined)await pool.query(`UPDATE monitoring_devices SET ${col}=? WHERE device_id=?`,[b[k]===""?null:b[k],id]);}
+  else if(n==="alerts"){if(req.account.role!=="super_admin")throw httpError(403,"Superadmin access is required.");const fields={title:"title",alertLevel:"alert_level",alertMessage:"alert_message",recommendedAction:"recommended_action",isResolved:"is_resolved",isRead:"is_read"};for(const[k,col]of Object.entries(fields))if(b[k]!==undefined)await pool.query(`UPDATE early_warning_notifications SET ${col}=? WHERE notification_id=?`,[b[k],id]);}
   else throw httpError(403,"This collection cannot be changed through this API.");
   res.json({id:String(id),...b});
  }catch(e){next(e);}

@@ -106,9 +106,19 @@ reset to set a new password.
 ## HyQual MySQL schema and demo seed
 
 The backend now uses the relational tables in `schema.sql` directly (accounts, user_profiles,
+addresses,
 aquaculture_farms, ponds, monitoring_devices, device_status, device_maintenance,
 water_quality_readings, water_quality_forecasts, parameter_thresholds,
 early_warning_notifications, activity_logs, and password_resets).
+
+Profile updates and farm/pond edits are written to `activity_logs` in the same
+transaction as the change. Farm owners may rename their own farms and ponds;
+other farm/pond fields remain restricted to superadmins. Audit descriptions
+identify the edited record and fields without storing passwords or field values.
+User addresses are stored in `addresses` by `user_profiles.user_id`; superadmins
+can enter or update them from User Management. Street, barangay, and city must
+all be provided together. Existing user address records are returned with the
+profile and displayed in the user details and profile pages.
 
 For a **new empty MySQL database**, run `schema.sql` first and then `seed_data.sql` against
 the same database. The application creates missing schema tables at startup, but deliberately
