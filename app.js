@@ -41,6 +41,23 @@ app.use(cors({
 
 
 function httpError(status, message) { const e = new Error(message); e.status = status; return e; }
+function normalizePhone(value) {
+  const input = String(value ?? "").trim();
+  if (!input) return null;
+  if (!/^\+?[\d ]+$/.test(input)) {
+    throw httpError(400, "Enter a valid Philippine mobile number (09xx xxx xxxx).");
+  }
+
+  let digits = input.replace(/[ +]/g, "");
+  if (digits.startsWith("63") && digits.length === 12) {
+    digits = `0${digits.slice(2)}`;
+  }
+  if (!/^09\d{9}$/.test(digits)) {
+    throw httpError(400, "Enter a valid Philippine mobile number (09xx xxx xxxx).");
+  }
+
+  return `${digits.slice(0, 4)} ${digits.slice(4, 7)} ${digits.slice(7)}`;
+}
 function hash(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
 function roleName(role) { return ({ farm_owner: "Farm Owner", admin: "BFAR Admin", super_admin: "Superadmin" })[role] || role; }
 function statusName(status) { return ({ active: "Active", inactive: "Inactive", disabled: "Inactive", suspended: "Suspended", pending: "Pending", rejected: "Rejected", archived: "Archived" })[status] || status; }
@@ -176,12 +193,13 @@ app.post("/api/auth/register",async(req,res,next)=>{
   try {
     const username=String(req.body.username||req.body.email||"").trim().toLowerCase();
     const email=normalizeEmail(req.body.email);
+    const phone=normalizePhone(req.body.phone||req.body.mobile);
     if(!username) throw httpError(400,"Username is required.");
     if(typeof req.body.password!=="string"||req.body.password.length<6) throw httpError(400,"Password must be at least 6 characters long.");
     const result=await withTransaction(async c=>{
       const a=await c.query("INSERT INTO accounts (username,password_hash,role,status) VALUES (?,?, 'farm_owner','pending')",[username,await bcrypt.hash(req.body.password,10)]);
       await c.query(`INSERT INTO user_profiles (account_id,first_name,middle_name,last_name,email,phone) VALUES (?,?,?,?,?,?)`,
-        [a.insertId,req.body.firstName||"Pending",req.body.middleName||null,req.body.lastName||"User",email,req.body.phone||req.body.mobile||null]);
+        [a.insertId,req.body.firstName||"Pending",req.body.middleName||null,req.body.lastName||"User",email,phone]);
       return a.insertId;
     });
     res.status(201).json({id:String(result),status:"Pending"});
@@ -240,13 +258,14 @@ app.get("/api/users",requireAuth,requireSuperadmin,async(_req,res,next)=>{
 app.post("/api/users",requireAuth,requireSuperadmin,async(req,res,next)=>{
  try{
   const username=String(req.body.username||req.body.email||"").trim().toLowerCase(), email=normalizeEmail(req.body.email);
+  const phone=normalizePhone(req.body.phone||req.body.mobile);
   const address=getAddressInput(req.body);
   if(!req.body.password||req.body.password.length<6) throw httpError(400,"Password must be at least 6 characters.");
   const role=({ "Superadmin":"super_admin","BFAR Admin":"admin","Farm Owner":"farm_owner",super_admin:"super_admin",admin:"admin",farm_owner:"farm_owner"})[req.body.role]||"farm_owner";
   const status=({Active:"active",Pending:"pending",Inactive:"disabled",Rejected:"rejected",active:"active",pending:"pending",disabled:"disabled",rejected:"rejected"})[req.body.status]||"active";
   const id=await withTransaction(async c=>{
    const a=await c.query("INSERT INTO accounts(username,password_hash,role,status) VALUES(?,?,?,?)",[username,await bcrypt.hash(req.body.password,10),role,status]);
-   const profile=await c.query("INSERT INTO user_profiles(account_id,first_name,middle_name,last_name,email,phone) VALUES(?,?,?,?,?,?)",[a.insertId,req.body.firstName||"",req.body.middleName||null,req.body.lastName||"",email,req.body.phone||req.body.mobile||null]);
+   const profile=await c.query("INSERT INTO user_profiles(account_id,first_name,middle_name,last_name,email,phone) VALUES(?,?,?,?,?,?)",[a.insertId,req.body.firstName||"",req.body.middleName||null,req.body.lastName||"",email,phone]);
    await saveUserAddress(c,profile.insertId,address);
    return a.insertId;
   });
@@ -256,7 +275,14 @@ app.post("/api/users",requireAuth,requireSuperadmin,async(req,res,next)=>{
 app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
  try{
   const id=Number(req.params.id);
+  const phone=normalizePhone(req.body.phone ?? req.body.mobile);
   const address=getAddressInput(req.body);
+  if(req.body.password!==undefined&&req.account.role!=="super_admin") {
+   throw httpError(403,"Only a superadmin may reset a user's password.");
+  }
+  if(req.body.password!==undefined&&(typeof req.body.password!=="string"||req.body.password.length<6)) {
+   throw httpError(400,"Password must be at least 6 characters.");
+  }
   if(address && req.account.role!=="super_admin") {
    throw httpError(403,"Only a superadmin may update a user's address.");
   }
@@ -269,6 +295,10 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
     FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
     WHERE a.account_id=? FOR UPDATE`,[id]);
    if(!rows[0]) throw httpError(404,"User not found.");
+   if(req.body.password!==undefined) {
+    await c.query("UPDATE accounts SET password_hash=? WHERE account_id=?",[await bcrypt.hash(req.body.password,10),id]);
+    await audit(req.account.account_id,"password_reset",`Reset password for account #${id}.`,c);
+   }
    if(req.account.role==="super_admin"){
     const map={Active:"active",Pending:"pending",Inactive:"inactive",Suspended:"suspended",Rejected:"rejected",active:"active",inactive:"inactive",disabled:"disabled",suspended:"suspended",rejected:"rejected"};
     if(req.body.status==="archived"||req.body.archived===true){
@@ -278,15 +308,16 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
     }else if(req.body.status){
      await c.query("UPDATE accounts SET status=? WHERE account_id=?",[map[req.body.status]||req.body.status,id]);
     }
-    if(req.body.role){
+    if(req.body.role!==undefined){
      const roles={"Farm Owner":"farm_owner","BFAR Admin":"admin","Superadmin":"super_admin"};
-     await c.query("UPDATE accounts SET role=? WHERE account_id=?",[roles[req.body.role]||req.body.role,id]);
+     const requestedRole=roles[req.body.role]||req.body.role;
+     if(requestedRole!==rows[0].role) throw httpError(403,"A user's role cannot be changed.");
     }
    }
    const updates=new Map();
    const fields={firstName:"first_name",middleName:"middle_name",lastName:"last_name",phone:"phone",mobile:"phone"};
    for(const [key,column] of Object.entries(fields)){
-    if(req.body[key]!==undefined) updates.set(column,req.body[key]||null);
+    if(req.body[key]!==undefined) updates.set(column,key==="phone"||key==="mobile"?phone:req.body[key]||null);
    }
    if(req.body.email!==undefined) updates.set("email",normalizeEmail(req.body.email));
    const changedFields=[];
