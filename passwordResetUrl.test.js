@@ -25,14 +25,16 @@ test("uses an allowlisted request origin when APP_URL is missing in production",
   assert.equal(url, "https://hyqual.example/reset-password?token=reset-token");
 });
 
-test("does not use a local URL in production", () => {
-  assert.throws(() => createPasswordResetUrl({
+test("allows a configured local website URL when testing against a production API", () => {
+  const url = createPasswordResetUrl({
     appUrl: "http://localhost:5173",
     origin: "http://localhost:5173",
     allowedOrigins: ["http://localhost:5173"],
     production: true,
     token: "reset-token",
-  }), { message: "APP_URL must use the public website URL in production." });
+  });
+
+  assert.equal(url, "http://localhost:5173/reset-password?token=reset-token");
 });
 
 test("uses localhost as the development fallback", () => {

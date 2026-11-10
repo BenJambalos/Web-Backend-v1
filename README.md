@@ -54,6 +54,9 @@ built web app and API from one Railway service:
 - Set `MYSQL_URL` to a Railway MySQL service variable reference, and set
   `APP_URL` to the public HTTPS frontend origin. If it is omitted, password
   reset links use the request origin only when it matches `CORS_ORIGIN`.
+  When testing a Railway backend from a local frontend, set `APP_URL` to the
+  local frontend URL (usually `http://localhost:5173`) in Railway's backend
+  variables; set `CORS_ORIGIN` to include that exact origin as well.
   Railway Free, Trial, and Hobby plans disable outbound SMTP, so configure a
   transactional email HTTPS API.
   Resend is supported with `RESEND_API_KEY` and `RESEND_FROM_EMAIL`; verify the
