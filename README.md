@@ -52,8 +52,10 @@ built web app and API from one Railway service:
 - Set the start command to `npm start --prefix backend`.
 - Keep the health check path `/api/health`.
 - Set `MYSQL_URL` to a Railway MySQL service variable reference, and set
-  `APP_URL` to the public HTTPS frontend origin. Railway Free, Trial, and Hobby
-  plans disable outbound SMTP, so configure a transactional email HTTPS API.
+  `APP_URL` to the public HTTPS frontend origin. If it is omitted, password
+  reset links use the request origin only when it matches `CORS_ORIGIN`.
+  Railway Free, Trial, and Hobby plans disable outbound SMTP, so configure a
+  transactional email HTTPS API.
   Resend is supported with `RESEND_API_KEY` and `RESEND_FROM_EMAIL`; verify the
   sender domain with Resend before sending to users. SMTP is also supported on
   platforms/plans that permit outbound SMTP by setting `SMTP_HOST`,

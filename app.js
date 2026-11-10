@@ -8,6 +8,7 @@ import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
 import { pool, withTransaction } from "./db.js";
 import { sendPasswordResetEmail } from "./mail.js";
+import { createPasswordResetUrl } from "./passwordResetUrl.js";
 import cors from "cors";
 
 const allowedOrigins = (
@@ -218,17 +219,19 @@ app.post("/api/auth/forgot-password",resetLimiter,async(req,res,next)=>{
   try{
     const email=normalizeEmail(req.body.email);
     const exposeResetToken=process.env.NODE_ENV!=="production"&&process.env.EXPOSE_RESET_TOKEN==="true";
-    const resetUrl=new URL("/reset-password",process.env.APP_URL||"http://localhost:5173");
-    if(!["http:","https:"].includes(resetUrl.protocol)) {
-      throw httpError(503,"APP_URL must use HTTP or HTTPS.");
-    }
     const {rows}=await pool.query("SELECT a.account_id,p.email FROM accounts a JOIN user_profiles p ON p.account_id=a.account_id WHERE LOWER(p.email)=?",[email]);
     if(rows[0]){
       const token=crypto.randomBytes(32).toString("hex");
       await pool.query("INSERT INTO password_resets (account_id,token,expires_at) VALUES (?,?,DATE_ADD(NOW(),INTERVAL 1 HOUR))",[rows[0].account_id,token]);
-      resetUrl.searchParams.set("token",token);
+      const resetUrl=createPasswordResetUrl({
+        appUrl:process.env.APP_URL,
+        origin:req.get("origin"),
+        allowedOrigins,
+        production:process.env.NODE_ENV==="production",
+        token,
+      });
       if(!exposeResetToken) {
-        await sendPasswordResetEmail(rows[0].email,resetUrl.toString());
+        await sendPasswordResetEmail(rows[0].email,resetUrl);
       }
       if(process.env.NODE_ENV!=="production") res.json({message:"If the account exists, reset instructions have been prepared.",...(exposeResetToken?{token}:{})});
       else res.json({message:"If the account exists, reset instructions have been sent."});
