@@ -101,7 +101,9 @@ function requireSuperadmin(req, res, next) {
   next();
 }
 function normalizeEmail(value) {
-  if (typeof value !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())) throw httpError(400, "A valid email address is required.");
+  if (typeof value !== "string" || !/^[A-Z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,}$/i.test(value.trim())) {
+    throw httpError(400, "Invalid email address.");
+  }
   return value.trim().toLowerCase();
 }
 function camelProfile(row) {
@@ -174,14 +176,15 @@ app.get("/api/health", async (_req,res,next)=>{ try { await pool.query("SELECT 1
 
 app.post("/api/auth/login", loginLimiter, async (req,res,next)=>{
   try {
-    const identifier = String(req.body.email || req.body.username || "").trim().toLowerCase();
+    const email = normalizeEmail(req.body.email);
     const {rows}=await pool.query(`SELECT a.*, p.first_name,p.middle_name,p.last_name,p.email,p.phone,
       ad.street,ad.barangay,ad.city
       FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
       ${PROFILE_ADDRESS_JOIN}
-      WHERE LOWER(a.username)=? OR LOWER(p.email)=? LIMIT 1`,[identifier,identifier]);
+      WHERE LOWER(p.email)=? LIMIT 1`,[email]);
     const row=rows[0];
-    if(!row?.password_hash || !(await bcrypt.compare(req.body.password || "",row.password_hash))) throw httpError(401,"Invalid username/email or password.");
+    if(!row) throw httpError(401,"This email does not exist.");
+    if(!row.password_hash || !(await bcrypt.compare(req.body.password || "",row.password_hash))) throw httpError(401,"Invalid email or password.");
     if(row.status!=="active") throw httpError(403,row.status==="pending"?"Your account is still pending approval.":"This account is not active.");
     await audit(row.account_id,"login","Signed in to HyQual website.");
     res.cookie(COOKIE,signSession(row.account_id,Date.now()+TTL),{httpOnly:true,secure:process.env.NODE_ENV==="production",sameSite:"lax",path:"/",maxAge:TTL});
