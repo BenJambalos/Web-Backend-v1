@@ -657,10 +657,17 @@ app.get("/api/device/readings/:parameter",requireAuth,async(req,res,next)=>{
   const limit=Math.max(1,Math.min(5000,Number(req.query.limit)||2000));
   const pondId=req.query.pondId==null?null:Number(req.query.pondId);
   if(pondId!==null&&(!Number.isInteger(pondId)||pondId<1))throw httpError(400,"Invalid pond ID.");
-  const where=pondId===null?`${col} IS NOT NULL`:`${col} IS NOT NULL AND pond_id=?`;
-  const values=pondId===null?[]:[pondId];
+  const farmId=req.query.farmId==null?null:Number(req.query.farmId);
+  if(farmId!==null&&(!Number.isInteger(farmId)||farmId<1))throw httpError(400,"Invalid farm ID.");
+  const conditions=[`w.${col} IS NOT NULL`];
+  const values=[];
+  if(pondId!==null){conditions.push("w.pond_id=?");values.push(pondId);}
+  if(farmId!==null){conditions.push("p.farm_id=?");values.push(farmId);}
+  const farmJoin=farmId===null?"":"JOIN ponds p ON p.pond_id=w.pond_id";
   const {rows}=await pool.query(
-   `SELECT reading_id,device_id,pond_id,${col} AS value,recorded_at FROM water_quality_readings WHERE ${where} ORDER BY recorded_at DESC LIMIT ${limit}`,
+   `SELECT w.reading_id,w.device_id,w.pond_id,w.${col} AS value,w.recorded_at
+    FROM water_quality_readings w ${farmJoin}
+    WHERE ${conditions.join(" AND ")} ORDER BY w.recorded_at DESC LIMIT ${limit}`,
    values,
   );
   res.json(rows.reverse().map(r=>({id:r.reading_id,deviceId:r.device_id,pondId:r.pond_id,parameter:req.params.parameter,value:Number(r.value),createdAt:new Date(r.recorded_at).toISOString()})));
