@@ -20,6 +20,7 @@ const allowedOrigins = (
 const app = express();
 const COOKIE = "hyqual_session";
 const TTL = 12 * 60 * 60 * 1000;
+const PRESENCE_TIMEOUT_SECONDS = 90;
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
@@ -65,7 +66,8 @@ function statusName(status) { return ({ active: "Active", inactive: "Inactive", 
 function makeUser(account, profile) {
   return { ...profile, id: String(account.account_id), uid: String(account.account_id),
     accountId: account.account_id, email: profile.email, username: account.username,
-    role: roleName(account.role), status: statusName(account.status), archived: account.status === "archived" };
+    role: roleName(account.role), status: statusName(account.status), archived: account.status === "archived",
+    lastSeen: account.last_seen || null };
 }
 function signSession(accountId, expiry) {
   const payload = `${accountId}.${expiry}`;
@@ -186,6 +188,9 @@ app.post("/api/auth/login", loginLimiter, async (req,res,next)=>{
     if(!row) throw httpError(401,"This email does not exist.");
     if(!row.password_hash || !(await bcrypt.compare(req.body.password || "",row.password_hash))) throw httpError(401,"Invalid email or password.");
     if(row.status!=="active") throw httpError(403,row.status==="pending"?"Your account is still pending approval.":"This account is not active.");
+    if(row.role==="admin"||row.role==="super_admin") {
+      await pool.query("UPDATE accounts SET last_seen=NOW() WHERE account_id=?",[row.account_id]);
+    }
     await audit(row.account_id,"login","Signed in to HyQual website.");
     res.cookie(COOKIE,signSession(row.account_id,Date.now()+TTL),{httpOnly:true,secure:process.env.NODE_ENV==="production",sameSite:"lax",path:"/",maxAge:TTL});
     res.json({user:makeUser(row,camelProfile(row))});
@@ -489,8 +494,25 @@ app.delete("/api/collections/:collection/:id",requireAuth,requireSuperadmin,asyn
  try{const table={farms:["aquaculture_farms","farm_id"],ponds:["ponds","pond_id"],devices:["monitoring_devices","device_id"],alerts:["early_warning_notifications","notification_id"]}[req.params.collection];if(!table)throw httpError(403,"This collection cannot be deleted through this API.");await pool.query(`DELETE FROM ${table[0]} WHERE ${table[1]}=?`,[Number(req.params.id)]);res.status(204).end();}catch(e){next(e);}
 });
 app.post("/api/audit-logs",requireAuth,async(req,res,next)=>{try{await audit(req.account.account_id,req.body.type||req.body.action||"activity",req.body.detail||req.body.action||"");res.status(204).end();}catch(e){next(e);}});
-app.post("/api/presence/heartbeat",requireAuth,(_req,res)=>res.status(204).end());
-app.get("/api/presence",requireAuth,requireSuperadmin,(_req,res)=>res.json([]));
+app.post("/api/presence/heartbeat",requireAuth,async(req,res,next)=>{
+ try{
+  if(req.account.role==="admin"||req.account.role==="super_admin") {
+   await pool.query("UPDATE accounts SET last_seen=NOW() WHERE account_id=?",[req.account.account_id]);
+  }
+  res.status(204).end();
+ }catch(e){next(e);}
+});
+app.get("/api/presence",requireAuth,requireSuperadmin,async(_req,res,next)=>{
+ try{
+  const {rows}=await pool.query(`SELECT account_id,last_seen,
+    last_seen>=CURRENT_TIMESTAMP-INTERVAL ${PRESENCE_TIMEOUT_SECONDS} SECOND AS is_online
+    FROM accounts WHERE role IN ('admin','super_admin') AND status='active' AND last_seen IS NOT NULL`);
+  res.json(Object.fromEntries(rows.map(row=>[String(row.account_id),{
+   state:row.is_online?"online":"offline",
+   lastChanged:new Date(row.last_seen).getTime(),
+  }])));
+ }catch(e){next(e);}
+});
 
 // Lightweight route used to verify which backend build is deployed.
 app.get("/api/health", async (_req, res) => {

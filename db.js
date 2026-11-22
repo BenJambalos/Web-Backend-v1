@@ -96,6 +96,13 @@ export async function initializeDatabase() {
       "ALTER TABLE accounts MODIFY COLUMN status_before_archive VARCHAR(32) DEFAULT NULL",
     );
   }
+
+  const [lastSeenColumns] = await connectionPool.query("SHOW COLUMNS FROM accounts LIKE 'last_seen'");
+  if (lastSeenColumns.length === 0) {
+    await connectionPool.query(
+      "ALTER TABLE accounts ADD COLUMN last_seen DATETIME DEFAULT NULL AFTER status_before_archive",
+    );
+  }
 }
 
 export async function runSqlFile(filePath) {

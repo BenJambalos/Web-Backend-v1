@@ -16,6 +16,8 @@
 --      OFFLINE even though it could not send a goodbye message.
 --   D. ML risk results, job runs, forecast indexes, and notification links
 --      are part of fresh installs; existing databases need migrations/004_ml_results.sql.
+--   E. accounts.last_seen stores the most recent admin web heartbeat; online
+--      status is inferred while that timestamp is within the 90-second window.
 --   For an EXISTING database run the applicable migration scripts instead of
 --   relying on this file to alter existing tables.
 --
@@ -61,6 +63,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   role           ENUM('admin', 'farm_owner', 'super_admin') NOT NULL DEFAULT 'farm_owner',   -- CORRECTION 7
   status         ENUM('active', 'inactive', 'disabled', 'suspended', 'pending', 'rejected', 'archived') NOT NULL DEFAULT 'pending', -- CORRECTION 7
   status_before_archive VARCHAR(32) DEFAULT NULL,
+  last_seen      DATETIME DEFAULT NULL,
   created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY username (username)
