@@ -11,6 +11,7 @@ import {
   assertBfarAdminActivationAvailable,
   disableActiveBfarAdmins,
 } from "./adminAccounts.js";
+import { auditValuesEqual, formatAuditChanges } from "./auditDescriptions.js";
 import { sendPasswordResetEmail } from "./mail.js";
 import { createPasswordResetUrl } from "./passwordResetUrl.js";
 import cors from "cors";
@@ -145,21 +146,24 @@ function getAddressInput(body) {
   return address;
 }
 async function saveUserAddress(client, profileUserId, address) {
-  if (!address) return false;
+  if (!address) return null;
   if (!profileUserId) throw new Error("Cannot save user address without a profile user ID.");
   const { rows } = await client.query(
     "SELECT address_id,street,barangay,city FROM addresses WHERE user_id=? ORDER BY address_id DESC LIMIT 1 FOR UPDATE",
     [profileUserId],
   );
   const current = rows[0];
+  const previousAddress = current
+    ? { street: current.street, barangay: current.barangay, city: current.city }
+    : null;
   if (Object.values(address).every((value) => !value)) {
     if (current) await client.query("DELETE FROM addresses WHERE user_id=?", [profileUserId]);
-    return Boolean(current);
+    return current ? { before: previousAddress, after: null } : null;
   }
   if (current) {
     if (current.street === address.street
       && current.barangay === address.barangay
-      && current.city === address.city) return false;
+      && current.city === address.city) return null;
     await client.query(
       "UPDATE addresses SET street=?,barangay=?,city=? WHERE address_id=?",
       [address.street, address.barangay, address.city, current.address_id],
@@ -170,7 +174,7 @@ async function saveUserAddress(client, profileUserId, address) {
       [profileUserId, address.street, address.barangay, address.city],
     );
   }
-  return true;
+  return { before: previousAddress, after: address };
 }
 async function audit(accountId, type, description, client = pool) {
   await client.query("INSERT INTO activity_logs (account_id, action_type, action_description) VALUES (?, ?, ?)", [accountId, type, description || null]);
@@ -211,8 +215,18 @@ app.post("/api/auth/register",async(req,res,next)=>{
     if(typeof req.body.password!=="string"||req.body.password.length<6) throw httpError(400,"Password must be at least 6 characters long.");
     const result=await withTransaction(async c=>{
       const a=await c.query("INSERT INTO accounts (username,password_hash,role,status) VALUES (?,?, 'farm_owner','pending')",[username,await bcrypt.hash(req.body.password,10)]);
+      const firstName=req.body.firstName||"Pending";
+      const middleName=req.body.middleName||null;
+      const lastName=req.body.lastName||"User";
       await c.query(`INSERT INTO user_profiles (account_id,first_name,middle_name,last_name,email,phone) VALUES (?,?,?,?,?,?)`,
-        [a.insertId,req.body.firstName||"Pending",req.body.middleName||null,req.body.lastName||"User",email,phone]);
+        [a.insertId,firstName,middleName,lastName,email,phone]);
+      await audit(a.insertId,"account_created",formatAuditChanges(`account #${a.insertId}`,[
+        {field:"role",from:null,to:roleName("farm_owner")},
+        {field:"user name",from:null,to:[firstName,middleName,lastName].filter(Boolean).join(" ")},
+        {field:"username",from:null,to:username},
+        {field:"email",from:null,to:email},
+        {field:"phone",from:null,to:phone},
+      ]),c);
       return a.insertId;
     });
     res.status(201).json({id:String(result),status:"Pending"});
@@ -223,7 +237,10 @@ app.post("/api/auth/password",requireAuth,async(req,res,next)=>{
     const {rows}=await pool.query("SELECT password_hash FROM accounts WHERE account_id=?",[req.account.account_id]);
     if(!(await bcrypt.compare(req.body.currentPassword||"",rows[0].password_hash))) throw httpError(400,"Current password is incorrect.");
     if(typeof req.body.newPassword!=="string"||req.body.newPassword.length<6) throw httpError(400,"New password must be at least 6 characters.");
-    await pool.query("UPDATE accounts SET password_hash=? WHERE account_id=?",[await bcrypt.hash(req.body.newPassword,10),req.account.account_id]);
+    await withTransaction(async c=>{
+      await c.query("UPDATE accounts SET password_hash=? WHERE account_id=?",[await bcrypt.hash(req.body.newPassword,10),req.account.account_id]);
+      await audit(req.account.account_id,"password_changed","Changed password (value not recorded).",c);
+    });
     res.status(204).end();
   }catch(e){next(e);}
 });
@@ -256,7 +273,11 @@ app.post("/api/auth/reset-password",async(req,res,next)=>{
    if(typeof password!=="string"||password.length<6) throw httpError(400,"Password must be at least 6 characters.");
    const {rows}=await pool.query("SELECT reset_id,account_id FROM password_resets WHERE token=? AND used=0 AND expires_at>NOW() ORDER BY created_at DESC LIMIT 1",[token]);
    if(!rows[0]) throw httpError(400,"This reset link is invalid or expired.");
-   await withTransaction(async c=>{await c.query("UPDATE accounts SET password_hash=? WHERE account_id=?",[await bcrypt.hash(password,10),rows[0].account_id]);await c.query("UPDATE password_resets SET used=1 WHERE reset_id=?",[rows[0].reset_id]);});
+   await withTransaction(async c=>{
+    await c.query("UPDATE accounts SET password_hash=? WHERE account_id=?",[await bcrypt.hash(password,10),rows[0].account_id]);
+    await c.query("UPDATE password_resets SET used=1 WHERE reset_id=?",[rows[0].reset_id]);
+    await audit(rows[0].account_id,"password_changed","Changed password through password recovery (value not recorded).",c);
+   });
    res.status(204).end();
  }catch(e){next(e);}
 });
@@ -288,8 +309,24 @@ app.post("/api/users",requireAuth,requireSuperadmin,async(req,res,next)=>{
     });
    }
    const a=await c.query("INSERT INTO accounts(username,password_hash,role,status) VALUES(?,?,?,?)",[username,await bcrypt.hash(req.body.password,10),role,status]);
-   const profile=await c.query("INSERT INTO user_profiles(account_id,first_name,middle_name,last_name,email,phone) VALUES(?,?,?,?,?,?)",[a.insertId,req.body.firstName||"",req.body.middleName||null,req.body.lastName||"",email,phone]);
-   await saveUserAddress(c,profile.insertId,address);
+   const firstName=req.body.firstName||"";
+   const middleName=req.body.middleName||null;
+   const lastName=req.body.lastName||"";
+   const profile=await c.query("INSERT INTO user_profiles(account_id,first_name,middle_name,last_name,email,phone) VALUES(?,?,?,?,?,?)",[a.insertId,firstName,middleName,lastName,email,phone]);
+   const addressChange=await saveUserAddress(c,profile.insertId,address);
+   const createdFields=[
+    {field:"role",from:null,to:roleName(role)},
+    {field:"user name",from:null,to:[firstName,middleName,lastName].filter(Boolean).join(" ")},
+    {field:"username",from:null,to:username},
+    {field:"email",from:null,to:email},
+    {field:"phone",from:null,to:phone},
+   ];
+   if(addressChange?.after){
+    for(const field of ["street","barangay","city"]){
+     createdFields.push({field,from:null,to:addressChange.after[field]});
+    }
+   }
+   await audit(req.account.account_id,"account_created",formatAuditChanges(`account #${a.insertId}`,createdFields),c);
    return a.insertId;
   });
   res.status(201).json({id:String(id)});
@@ -324,19 +361,30 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
     FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
     WHERE a.account_id=? FOR UPDATE`,[id]);
    if(!rows[0]) throw httpError(404,"User not found.");
+   const accountChanges=[];
    if(req.body.password!==undefined) {
     await c.query("UPDATE accounts SET password_hash=? WHERE account_id=?",[await bcrypt.hash(req.body.password,10),id]);
-    await audit(req.account.account_id,"password_reset",`Reset password for account #${id}.`,c);
+    await audit(req.account.account_id,"password_reset",`Reset password for account #${id} (value not recorded).`,c);
    }
    if(req.account.role==="super_admin"){
     const map={Active:"active",Pending:"pending",Inactive:"inactive",Suspended:"suspended",Rejected:"rejected",active:"active",inactive:"inactive",disabled:"disabled",suspended:"suspended",rejected:"rejected"};
     if(req.body.status==="archived"||req.body.archived===true){
      await c.query("UPDATE accounts SET status_before_archive=IF(status='archived',status_before_archive,status),status='archived' WHERE account_id=?",[id]);
+     if(rows[0].status!=="archived"){
+      accountChanges.push({field:"status",from:statusName(rows[0].status),to:statusName("archived")});
+     }
     }else if(req.body.archived===false){
      await c.query("UPDATE accounts SET status=COALESCE(status_before_archive,'active'),status_before_archive=NULL WHERE account_id=? AND status='archived'",[id]);
+     const restoredStatus=rows[0].status==="archived"?(rows[0].status_before_archive||"active"):rows[0].status;
+     if(rows[0].status!==restoredStatus){
+      accountChanges.push({field:"status",from:statusName(rows[0].status),to:statusName(restoredStatus)});
+     }
     }else if(req.body.status){
      const nextStatus=map[req.body.status]||req.body.status;
      await c.query("UPDATE accounts SET status=? WHERE account_id=?",[nextStatus,id]);
+     if(!auditValuesEqual(rows[0].status,nextStatus)){
+      accountChanges.push({field:"status",from:statusName(rows[0].status),to:statusName(nextStatus)});
+     }
     }
     if(req.body.role!==undefined){
      const roles={"Farm Owner":"farm_owner","BFAR Admin":"admin","Superadmin":"super_admin"};
@@ -350,17 +398,42 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
     if(req.body[key]!==undefined) updates.set(column,key==="phone"||key==="mobile"?phone:req.body[key]||null);
    }
    if(req.body.email!==undefined) updates.set("email",normalizeEmail(req.body.email));
-   const changedFields=[];
-   const labels={first_name:"first name",middle_name:"middle name",last_name:"last name",phone:"mobile number",email:"email"};
+   const profileChanges=[];
+   let nameChanged=false;
    for(const [column,value] of updates){
-    if(String(rows[0][column]??"")===String(value??"")) continue;
+    if(auditValuesEqual(rows[0][column],value)) continue;
     await c.query(`UPDATE user_profiles SET ${column}=? WHERE account_id=?`,[value,id]);
-    changedFields.push(labels[column]);
+    if(["first_name","middle_name","last_name"].includes(column)){
+     nameChanged=true;
+    }else{
+     const label=column==="email"?"email / login name":column==="phone"?"mobile number":column;
+     profileChanges.push({field:label,from:rows[0][column],to:value});
+    }
    }
-   if(await saveUserAddress(c,rows[0].user_id,address)) changedFields.push("address");
-   if(changedFields.length){
+   if(nameChanged){
+    const nextName=["first_name","middle_name","last_name"]
+     .map(column=>updates.has(column)?updates.get(column):rows[0][column])
+     .filter(Boolean)
+     .join(" ");
+    const previousName=[rows[0].first_name,rows[0].middle_name,rows[0].last_name].filter(Boolean).join(" ");
+    profileChanges.unshift({field:"user name",from:previousName,to:nextName});
+   }
+   const addressChange=await saveUserAddress(c,rows[0].user_id,address);
+   if(addressChange){
+    for(const field of ["street","barangay","city"]){
+     profileChanges.push({
+      field,
+      from:addressChange.before?.[field]??null,
+      to:addressChange.after?.[field]??null,
+     });
+    }
+   }
+   if(profileChanges.length){
     const target=id===req.account.account_id?"own profile":`profile for account #${id}`;
-    await audit(req.account.account_id,"profile_updated",`Edited ${target}; changed ${changedFields.join(", ")}.`,c);
+    await audit(req.account.account_id,"profile_updated",formatAuditChanges(target,profileChanges),c);
+   }
+   if(accountChanges.length){
+    await audit(req.account.account_id,"account_updated",formatAuditChanges(`account #${id}`,accountChanges),c);
    }
    const {rows:updatedRows}=await c.query(`SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone,
     ad.street,ad.barangay,ad.city
@@ -453,17 +526,77 @@ app.post("/api/collections/:collection",requireAuth,requireSuperadmin,async(req,
  try{
   const n=req.params.collection,b=req.body;
   if(n==="farms"){
-   const r=await pool.query("INSERT INTO aquaculture_farms(owner_id,farm_name,street,barangay,municipality,province,zip_code,location) VALUES(?,?,?,?,?,?,?,?)",[Number(b.ownerId),b.farmName||b.name||"New farm",b.street||null,b.barangay||null,b.city||b.municipality||null,b.province||null,b.zip||b.zipCode||null,b.location||null]);return res.status(201).json({id:String(r.insertId)});
+   const farm={
+    ownerId:Number(b.ownerId),
+    farmName:b.farmName||b.name||"New farm",
+    street:b.street||null,
+    barangay:b.barangay||null,
+    city:b.city||b.municipality||null,
+    province:b.province||null,
+    zip:b.zip||b.zipCode||null,
+    location:b.location||null,
+   };
+   const id=await withTransaction(async c=>{
+    const r=await c.query("INSERT INTO aquaculture_farms(owner_id,farm_name,street,barangay,municipality,province,zip_code,location) VALUES(?,?,?,?,?,?,?,?)",[farm.ownerId,farm.farmName,farm.street,farm.barangay,farm.city,farm.province,farm.zip,farm.location]);
+    await audit(req.account.account_id,"farm_created",formatAuditChanges(`farm #${r.insertId}`,[
+     {field:"owner account",from:null,to:farm.ownerId},
+     {field:"farm name",from:null,to:farm.farmName},
+     {field:"street",from:null,to:farm.street},
+     {field:"barangay",from:null,to:farm.barangay},
+     {field:"city",from:null,to:farm.city},
+     {field:"province",from:null,to:farm.province},
+     {field:"ZIP code",from:null,to:farm.zip},
+     {field:"location",from:null,to:farm.location},
+    ]),c);
+    return r.insertId;
+   });
+   return res.status(201).json({id:String(id)});
   }
   if(n==="ponds"){
-   const r=await pool.query("INSERT INTO ponds(farm_id,pond_name,volume) VALUES(?,?,?)",[Number(b.farmId),b.pondName||b.name||"New pond",b.volume??null]);return res.status(201).json({id:String(r.insertId)});
+   const pond={farmId:Number(b.farmId),pondName:b.pondName||b.name||"New pond",volume:b.volume??null};
+   const id=await withTransaction(async c=>{
+    const r=await c.query("INSERT INTO ponds(farm_id,pond_name,volume) VALUES(?,?,?)",[pond.farmId,pond.pondName,pond.volume]);
+    await audit(req.account.account_id,"pond_created",formatAuditChanges(`pond #${r.insertId}`,[
+     {field:"farm ID",from:null,to:pond.farmId},
+     {field:"pond name",from:null,to:pond.pondName},
+     {field:"volume",from:null,to:pond.volume},
+    ]),c);
+    return r.insertId;
+   });
+   return res.status(201).json({id:String(id)});
   }
   if(n==="devices"){
    const key=crypto.randomBytes(24).toString("hex");
-   const r=await pool.query("INSERT INTO monitoring_devices(farm_id,pond_id,device_name,status,device_key) VALUES(?,?,?,?,?)",[Number(b.farmId),b.pondId?Number(b.pondId):null,b.deviceName||b.name||"New device",b.status||"active",key]);return res.status(201).json({id:String(r.insertId),deviceKey:key});
+   const device={farmId:Number(b.farmId),pondId:b.pondId?Number(b.pondId):null,deviceName:b.deviceName||b.name||"New device",status:b.status||"active"};
+   const id=await withTransaction(async c=>{
+    const r=await c.query("INSERT INTO monitoring_devices(farm_id,pond_id,device_name,status,device_key) VALUES(?,?,?,?,?)",[device.farmId,device.pondId,device.deviceName,device.status,key]);
+    await audit(req.account.account_id,"device_created",formatAuditChanges(`device #${r.insertId}`,[
+     {field:"farm ID",from:null,to:device.farmId},
+     {field:"pond ID",from:null,to:device.pondId},
+     {field:"device name",from:null,to:device.deviceName},
+     {field:"status",from:null,to:device.status},
+    ]),c);
+    return r.insertId;
+   });
+   return res.status(201).json({id:String(id),deviceKey:key});
   }
   if(n==="alerts"){
-   const r=await pool.query("INSERT INTO early_warning_notifications(farm_id,pond_id,device_id,parameter,title,alert_level,alert_message,recommended_action) VALUES(?,?,?,?,?,?,?,?)",[Number(b.farmId),b.pondId?Number(b.pondId):null,b.deviceId?Number(b.deviceId):null,b.parameter||null,b.title||"Notification",b.alertLevel||b.status||"low",b.alertMessage||b.message||"",b.recommendedAction||null]);return res.status(201).json({id:String(r.insertId)});
+   const alert={farmId:Number(b.farmId),pondId:b.pondId?Number(b.pondId):null,deviceId:b.deviceId?Number(b.deviceId):null,parameter:b.parameter||null,title:b.title||"Notification",alertLevel:b.alertLevel||b.status||"low",alertMessage:b.alertMessage||b.message||"",recommendedAction:b.recommendedAction||null};
+   const id=await withTransaction(async c=>{
+    const r=await c.query("INSERT INTO early_warning_notifications(farm_id,pond_id,device_id,parameter,title,alert_level,alert_message,recommended_action) VALUES(?,?,?,?,?,?,?,?)",[alert.farmId,alert.pondId,alert.deviceId,alert.parameter,alert.title,alert.alertLevel,alert.alertMessage,alert.recommendedAction]);
+    await audit(req.account.account_id,"alert_created",formatAuditChanges(`alert #${r.insertId}`,[
+     {field:"farm ID",from:null,to:alert.farmId},
+     {field:"pond ID",from:null,to:alert.pondId},
+     {field:"device ID",from:null,to:alert.deviceId},
+     {field:"parameter",from:null,to:alert.parameter},
+     {field:"title",from:null,to:alert.title},
+     {field:"alert level",from:null,to:alert.alertLevel},
+     {field:"message",from:null,to:alert.alertMessage},
+     {field:"recommended action",from:null,to:alert.recommendedAction},
+    ]),c);
+    return r.insertId;
+   });
+   return res.status(201).json({id:String(id)});
   }
   throw httpError(403,"This collection cannot be created through this API.");
  }catch(e){next(e);}
@@ -499,24 +632,61 @@ app.patch("/api/collections/:collection/:id",requireAuth,async(req,res,next)=>{
     const labels=isFarm
      ?{farm_name:"farm name",owner_id:"owner",street:"street",barangay:"barangay",municipality:"municipality",province:"province",zip_code:"ZIP code",location:"location"}
      :{pond_name:"pond name",farm_id:"farm",volume:"volume"};
-    const changedFields=[];
+    const changes=[];
     for(const [column,value] of updates){
      const normalizedValue=column==="owner_id"||column==="farm_id" ? Number(value) : value;
-     const isSameVolume=column==="volume"
-      && ((current.volume==null&&normalizedValue==null)
-       ||(current.volume!=null&&normalizedValue!=null&&Number(current.volume)===Number(normalizedValue)));
-     if(isSameVolume||String(current[column]??"")===String(normalizedValue??"")) continue;
+     if(auditValuesEqual(current[column],normalizedValue)) continue;
      await c.query(`UPDATE ${table} SET ${column}=? WHERE ${idColumn}=?`,[normalizedValue,id]);
-     changedFields.push(labels[column]);
+     changes.push({field:labels[column],from:current[column],to:normalizedValue});
     }
-    if(changedFields.length){
+    if(changes.length){
      const entity=isFarm?`farm #${id}`:`pond #${id}`;
-     await audit(req.account.account_id,isFarm?"farm_updated":"pond_updated",`Edited ${entity}; changed ${changedFields.join(", ")}.`,c);
+     await audit(req.account.account_id,isFarm?"farm_updated":"pond_updated",formatAuditChanges(entity,changes),c);
     }
    });
   }
-  else if(n==="devices"){if(req.account.role!=="super_admin")throw httpError(403,"Superadmin access is required.");const fields={deviceName:"device_name",status:"status",farmId:"farm_id",pondId:"pond_id"};for(const[k,col]of Object.entries(fields))if(b[k]!==undefined)await pool.query(`UPDATE monitoring_devices SET ${col}=? WHERE device_id=?`,[b[k]===""?null:b[k],id]);}
-  else if(n==="alerts"){if(req.account.role!=="super_admin")throw httpError(403,"Superadmin access is required.");const fields={title:"title",alertLevel:"alert_level",alertMessage:"alert_message",recommendedAction:"recommended_action",isResolved:"is_resolved",isRead:"is_read"};for(const[k,col]of Object.entries(fields))if(b[k]!==undefined)await pool.query(`UPDATE early_warning_notifications SET ${col}=? WHERE notification_id=?`,[b[k],id]);}
+  else if(n==="devices"){
+   if(req.account.role!=="super_admin")throw httpError(403,"Superadmin access is required.");
+   await withTransaction(async c=>{
+    const {rows}=await c.query("SELECT device_id,farm_id,pond_id,device_name,status FROM monitoring_devices WHERE device_id=? FOR UPDATE",[id]);
+    if(!rows[0])throw httpError(404,"Device not found.");
+    const current=rows[0];
+    const fields={deviceName:["device_name","device name"],status:["status","status"],farmId:["farm_id","farm ID"],pondId:["pond_id","pond ID"]};
+    const changes=[];
+    for(const[key,[column,label]]of Object.entries(fields)){
+     if(b[key]===undefined)continue;
+     const value=b[key]===""?null:(column==="farm_id"||column==="pond_id"?Number(b[key]):b[key]);
+     if(auditValuesEqual(current[column],value))continue;
+     await c.query(`UPDATE monitoring_devices SET ${column}=? WHERE device_id=?`,[value,id]);
+     changes.push({field:label,from:current[column],to:value});
+    }
+    if(changes.length)await audit(req.account.account_id,"device_updated",formatAuditChanges(`device #${id}`,changes),c);
+   });
+  }
+  else if(n==="alerts"){
+   if(req.account.role!=="super_admin")throw httpError(403,"Superadmin access is required.");
+   await withTransaction(async c=>{
+    const {rows}=await c.query("SELECT notification_id,farm_id,pond_id,device_id,parameter,title,alert_level,alert_message,recommended_action,is_resolved,is_read FROM early_warning_notifications WHERE notification_id=? FOR UPDATE",[id]);
+    if(!rows[0])throw httpError(404,"Alert not found.");
+    const current=rows[0];
+    const fields={
+     title:["title","title"],
+     alertLevel:["alert_level","alert level"],
+     alertMessage:["alert_message","message"],
+     recommendedAction:["recommended_action","recommended action"],
+     isResolved:["is_resolved","resolved"],
+     isRead:["is_read","read"],
+    };
+    const changes=[];
+    for(const[key,[column,label]]of Object.entries(fields)){
+     if(b[key]===undefined)continue;
+     if(auditValuesEqual(current[column],b[key]))continue;
+     await c.query(`UPDATE early_warning_notifications SET ${column}=? WHERE notification_id=?`,[b[key],id]);
+     changes.push({field:label,from:current[column],to:b[key]});
+    }
+    if(changes.length)await audit(req.account.account_id,"alert_updated",formatAuditChanges(`alert #${id}`,changes),c);
+   });
+  }
   else throw httpError(403,"This collection cannot be changed through this API.");
   res.json({id:String(id),...b});
  }catch(e){next(e);}
@@ -645,14 +815,47 @@ app.post("/api/device/registrations",requireAuth,async(req,res,next)=>{
   const b=req.body;if(!b.farmId)throw httpError(400,"farmId is required.");
   const {rows}=await pool.query("SELECT farm_id FROM aquaculture_farms WHERE farm_id=?",[Number(b.farmId)]);if(!rows[0])throw httpError(400,"The selected farm does not exist.");
   const key=crypto.randomBytes(24).toString("hex");
-  const r=await pool.query("INSERT INTO monitoring_devices(farm_id,pond_id,device_name,status,device_key) VALUES(?,?,?,?,?)",[Number(b.farmId),b.pondId?Number(b.pondId):null,b.deviceName||b.name||"Monitoring device","active",key]);
-  res.status(201).json({id:String(r.insertId),deviceId:String(r.insertId),deviceKey:key});
+  const device={farmId:Number(b.farmId),pondId:b.pondId?Number(b.pondId):null,deviceName:b.deviceName||b.name||"Monitoring device"};
+  const id=await withTransaction(async c=>{
+   const r=await c.query("INSERT INTO monitoring_devices(farm_id,pond_id,device_name,status,device_key) VALUES(?,?,?,?,?)",[device.farmId,device.pondId,device.deviceName,"active",key]);
+   await audit(req.account.account_id,"device_created",formatAuditChanges(`device #${r.insertId}`,[
+    {field:"farm ID",from:null,to:device.farmId},
+    {field:"pond ID",from:null,to:device.pondId},
+    {field:"device name",from:null,to:device.deviceName},
+    {field:"status",from:null,to:"active"},
+   ]),c);
+   return r.insertId;
+  });
+  res.status(201).json({id:String(id),deviceId:String(id),deviceKey:key});
  }catch(e){next(e);}
 });
 app.post("/api/devices/:deviceId/credentials",requireAuth,requireSuperadmin,async(req,res,next)=>{
- try{const id=Number(req.params.deviceId);const token=crypto.randomBytes(32).toString("base64url");await pool.query("UPDATE monitoring_devices SET device_key=? WHERE device_id=?",[token,id]);const {rows}=await pool.query("SELECT device_id FROM monitoring_devices WHERE device_id=?",[id]);if(!rows[0])throw httpError(404,"Device not found.");res.status(201).json({deviceId:String(id),token});}catch(e){next(e);}
+ try{
+  const id=Number(req.params.deviceId);
+  const token=crypto.randomBytes(32).toString("base64url");
+  await withTransaction(async c=>{
+   const {rows}=await c.query("SELECT device_id FROM monitoring_devices WHERE device_id=? FOR UPDATE",[id]);
+   if(!rows[0])throw httpError(404,"Device not found.");
+   await c.query("UPDATE monitoring_devices SET device_key=? WHERE device_id=?",[token,id]);
+   await audit(req.account.account_id,"device_credentials_provisioned",`Provisioned credentials for device #${id} (secret not recorded).`,c);
+  });
+  res.status(201).json({deviceId:String(id),token});
+ }catch(e){next(e);}
 });
-app.delete("/api/devices/:deviceId/credentials",requireAuth,requireSuperadmin,async(req,res,next)=>{try{await pool.query("UPDATE monitoring_devices SET device_key=NULL WHERE device_id=?",[Number(req.params.deviceId)]);res.status(204).end();}catch(e){next(e);}});
+app.delete("/api/devices/:deviceId/credentials",requireAuth,requireSuperadmin,async(req,res,next)=>{
+ try{
+  const id=Number(req.params.deviceId);
+  await withTransaction(async c=>{
+   const {rows}=await c.query("SELECT device_id,device_key FROM monitoring_devices WHERE device_id=? FOR UPDATE",[id]);
+   if(!rows[0])throw httpError(404,"Device not found.");
+   if(rows[0].device_key){
+    await c.query("UPDATE monitoring_devices SET device_key=NULL WHERE device_id=?",[id]);
+    await audit(req.account.account_id,"device_credentials_revoked",`Revoked credentials for device #${id} (secret not recorded).`,c);
+   }
+  });
+  res.status(204).end();
+ }catch(e){next(e);}
+});
 async function requireDevice(req,res,next){try{const id=Number(req.get("x-device-id"));const key=req.get("x-device-token")||"";const {rows}=await pool.query("SELECT device_id,device_key,pond_id FROM monitoring_devices WHERE device_id=? AND status='active'",[id]);if(!rows[0]||!rows[0].device_key||rows[0].device_key!==key)throw httpError(401,"Device credentials are invalid or revoked.");req.device=rows[0];next();}catch(e){next(e);}}
 app.post("/api/device/state",requireDevice,async(req,res,next)=>{
  try{const b=req.body;const allowed=["battery","status","assignment"];if(!allowed.includes(b.stateKey)||b.value===undefined)throw httpError(400,"A supported stateKey and value are required.");
