@@ -361,6 +361,28 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
     FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
     WHERE a.account_id=? FOR UPDATE`,[id]);
    if(!rows[0]) throw httpError(404,"User not found.");
+   if(req.body.farmName!==undefined){
+    if(req.account.role!=="super_admin") throw httpError(403,"Only a superadmin may update an aquafarm name.");
+    if(typeof req.body.farmName!=="string") throw httpError(400,"Aquafarm name must be text.");
+    const requestedFarmName=req.body.farmName.trim();
+    const {rows:farmRows}=await c.query(
+     "SELECT farm_id,farm_name FROM aquaculture_farms WHERE owner_id=? ORDER BY farm_id FOR UPDATE",
+     [id],
+    );
+    const currentFarmName=farmRows.map(farm=>farm.farm_name).join(", ");
+    if(requestedFarmName!==currentFarmName){
+     if(farmRows.length===0) throw httpError(400,"This account does not have an aquafarm to rename.");
+     if(farmRows.length>1) throw httpError(400,"This account has multiple aquafarms; edit a specific aquafarm name.");
+     if(!requestedFarmName) throw httpError(400,"Aquafarm name cannot be empty.");
+     const farm=farmRows[0];
+     if(!auditValuesEqual(farm.farm_name,requestedFarmName)){
+      await c.query("UPDATE aquaculture_farms SET farm_name=? WHERE farm_id=?",[requestedFarmName,farm.farm_id]);
+      await audit(req.account.account_id,"farm_updated",formatAuditChanges(`farm #${farm.farm_id}`,[
+       {field:"farm name",from:farm.farm_name,to:requestedFarmName},
+      ]),c);
+     }
+    }
+   }
    const accountChanges=[];
    if(req.body.password!==undefined) {
     await c.query("UPDATE accounts SET password_hash=? WHERE account_id=?",[await bcrypt.hash(req.body.password,10),id]);

@@ -12,6 +12,15 @@ test("formats old and new user-provided values in an audit description", () => {
   );
 });
 
+test("records an aquafarm rename with its previous and new names", () => {
+  assert.equal(
+    formatAuditChanges("farm #7", [
+      { field: "farm name", from: "Old Aquafarm", to: "New Aquafarm" },
+    ]),
+    'farm #7: changed farm name from "Old Aquafarm" to "New Aquafarm".',
+  );
+});
+
 test("describes clearing fields and normalizes database boolean and numeric values", () => {
   assert.equal(auditValuesEqual(0, false), true);
   assert.equal(auditValuesEqual(null, ""), true);
