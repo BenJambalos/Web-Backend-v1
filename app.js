@@ -400,6 +400,7 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
    if(req.body.email!==undefined) updates.set("email",normalizeEmail(req.body.email));
    const profileChanges=[];
    let nameChanged=false;
+   const previousName=[rows[0].first_name,rows[0].middle_name,rows[0].last_name].filter(Boolean).join(" ");
    for(const [column,value] of updates){
     if(auditValuesEqual(rows[0][column],value)) continue;
     await c.query(`UPDATE user_profiles SET ${column}=? WHERE account_id=?`,[value,id]);
@@ -410,13 +411,14 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
      profileChanges.push({field:label,from:rows[0][column],to:value});
     }
    }
+   let targetName=previousName;
    if(nameChanged){
     const nextName=["first_name","middle_name","last_name"]
      .map(column=>updates.has(column)?updates.get(column):rows[0][column])
      .filter(Boolean)
      .join(" ");
-    const previousName=[rows[0].first_name,rows[0].middle_name,rows[0].last_name].filter(Boolean).join(" ");
-    profileChanges.unshift({field:"user name",from:previousName,to:nextName});
+    targetName=nextName||previousName;
+    profileChanges.unshift({field:"full name",from:previousName,to:nextName});
    }
    const addressChange=await saveUserAddress(c,rows[0].user_id,address);
    if(addressChange){
@@ -429,7 +431,9 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
     }
    }
    if(profileChanges.length){
-    const target=id===req.account.account_id?"own profile":`profile for account #${id}`;
+    const target=id===req.account.account_id
+     ?"own profile"
+     :targetName?`profile for ${targetName} (account #${id})`:`profile for account #${id}`;
     await audit(req.account.account_id,"profile_updated",formatAuditChanges(target,profileChanges),c);
    }
    if(accountChanges.length){
@@ -510,7 +514,28 @@ async function collectionData(name){
  }
  if(name==="auditLogs"){
   const {rows}=await pool.query("SELECT l.*,a.username,a.role,p.first_name,p.last_name FROM activity_logs l JOIN accounts a ON a.account_id=l.account_id LEFT JOIN user_profiles p ON p.account_id=a.account_id ORDER BY l.logged_at DESC LIMIT 5000");
-  return rows.map(r=>({id:String(r.log_id),actorId:String(r.account_id),actor:[r.first_name,r.last_name].filter(Boolean).join(" ")||r.username,actorRole:roleName(r.role),type:r.action_type,action:r.action_type,detail:r.action_description,createdAt:r.logged_at}));
+  const targetIds=[...new Set(rows.flatMap(r=>{
+   const match=String(r.action_description||"").match(/profile for account #(\d+)/i);
+   return match?[Number(match[1])]:[];
+  }))];
+  const targetNames=new Map();
+  if(targetIds.length){
+   const placeholders=targetIds.map(()=>"?").join(",");
+   const {rows:targets}=await pool.query(`SELECT a.account_id,a.username,p.first_name,p.middle_name,p.last_name
+    FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
+    WHERE a.account_id IN (${placeholders})`,targetIds);
+   for(const target of targets){
+    const fullName=[target.first_name,target.middle_name,target.last_name].filter(Boolean).join(" ");
+    targetNames.set(Number(target.account_id),fullName||target.username);
+   }
+  }
+  return rows.map(r=>{
+   let detail=r.action_description;
+   const match=String(detail||"").match(/profile for account #(\d+)/i);
+   const targetName=match&&targetNames.get(Number(match[1]));
+   if(targetName) detail=detail.replace(match[0],`profile for ${targetName} (account #${match[1]})`);
+   return {id:String(r.log_id),actorId:String(r.account_id),actor:[r.first_name,r.last_name].filter(Boolean).join(" ")||r.username,actorRole:roleName(r.role),type:r.action_type,action:r.action_type,detail,createdAt:r.logged_at};
+  });
  }
  throw httpError(404,"Collection not found.");
 }

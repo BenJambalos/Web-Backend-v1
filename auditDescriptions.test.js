@@ -4,11 +4,11 @@ import { auditValuesEqual, formatAuditChanges } from "./auditDescriptions.js";
 
 test("formats old and new user-provided values in an audit description", () => {
   assert.equal(
-    formatAuditChanges("profile for account #12", [
-      { field: "user name", from: "Jane Doe", to: "Jane Smith" },
+    formatAuditChanges("profile for Jane Smith (account #12)", [
+      { field: "full name", from: "Jane Doe", to: "Jane Smith" },
       { field: "street", from: null, to: "12 Bay Road" },
     ]),
-    'profile for account #12: changed user name from "Jane Doe" to "Jane Smith"; added street "12 Bay Road".',
+    'profile for Jane Smith (account #12): changed full name from "Jane Doe" to "Jane Smith"; added street "12 Bay Road".',
   );
 });
 
