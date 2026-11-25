@@ -7,6 +7,10 @@ import express from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
 import { pool, withTransaction } from "./db.js";
+import {
+  assertBfarAdminActivationAvailable,
+  disableActiveBfarAdmins,
+} from "./adminAccounts.js";
 import { sendPasswordResetEmail } from "./mail.js";
 import { createPasswordResetUrl } from "./passwordResetUrl.js";
 import cors from "cors";
@@ -262,7 +266,8 @@ app.get("/api/users",requireAuth,requireSuperadmin,async(_req,res,next)=>{
   const {rows}=await pool.query(`SELECT a.*,p.first_name,p.middle_name,p.last_name,p.email,p.phone,
     ad.street,ad.barangay,ad.city
     FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
-    ${PROFILE_ADDRESS_JOIN} ORDER BY a.created_at DESC LIMIT 5000`);
+    ${PROFILE_ADDRESS_JOIN} WHERE NOT (a.role='admin' AND a.status='disabled')
+    ORDER BY a.created_at DESC LIMIT 5000`);
   res.json(rows.map(r=>makeUser(r,camelProfile(r))));
  }catch(e){next(e);}
 });
@@ -275,6 +280,13 @@ app.post("/api/users",requireAuth,requireSuperadmin,async(req,res,next)=>{
   const role=({ "Superadmin":"super_admin","BFAR Admin":"admin","Farm Owner":"farm_owner",super_admin:"super_admin",admin:"admin",farm_owner:"farm_owner"})[req.body.role]||"farm_owner";
   const status=({Active:"active",Pending:"pending",Inactive:"disabled",Rejected:"rejected",active:"active",pending:"pending",disabled:"disabled",rejected:"rejected"})[req.body.status]||"active";
   const id=await withTransaction(async c=>{
+   if(role==="admin"&&status==="active"){
+    await disableActiveBfarAdmins(c,{
+     actorAccountId:req.account.account_id,
+     confirmed:req.body.replaceActiveAdmin===true,
+     audit,
+    });
+   }
    const a=await c.query("INSERT INTO accounts(username,password_hash,role,status) VALUES(?,?,?,?)",[username,await bcrypt.hash(req.body.password,10),role,status]);
    const profile=await c.query("INSERT INTO user_profiles(account_id,first_name,middle_name,last_name,email,phone) VALUES(?,?,?,?,?,?)",[a.insertId,req.body.firstName||"",req.body.middleName||null,req.body.lastName||"",email,phone]);
    await saveUserAddress(c,profile.insertId,address);
@@ -302,6 +314,12 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
    throw httpError(403,"You cannot change your own email address.");
   }
   const updated=await withTransaction(async c=>{
+   if(req.account.role==="super_admin"&&["Active","active"].includes(req.body.status)){
+    await assertBfarAdminActivationAvailable(c,{
+     actorAccountId:req.account.account_id,
+     targetAccountId:id,
+    });
+   }
    const {rows}=await c.query(`SELECT a.*,p.user_id,p.first_name,p.middle_name,p.last_name,p.email,p.phone
     FROM accounts a LEFT JOIN user_profiles p ON p.account_id=a.account_id
     WHERE a.account_id=? FOR UPDATE`,[id]);
@@ -355,7 +373,19 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
 app.delete("/api/users/:id",requireAuth,requireSuperadmin,async(req,res,next)=>{
  try{if(Number(req.params.id)===req.account.account_id) throw httpError(400,"You cannot delete your own account.");await pool.query("DELETE FROM accounts WHERE account_id=?",[Number(req.params.id)]);res.status(204).end();}catch(e){next(e);}
 });
-app.post("/api/approvals/:id/approve",requireAuth,requireSuperadmin,async(req,res,next)=>{try{await pool.query("UPDATE accounts SET status='active' WHERE account_id=? AND status='pending'",[Number(req.params.id)]);await audit(req.account.account_id,"account_approved",`Approved account ${req.params.id}`);res.status(204).end();}catch(e){next(e);}});
+app.post("/api/approvals/:id/approve",requireAuth,requireSuperadmin,async(req,res,next)=>{
+ try{
+  await withTransaction(async c=>{
+   await assertBfarAdminActivationAvailable(c,{
+    actorAccountId:req.account.account_id,
+    targetAccountId:Number(req.params.id),
+   });
+   await c.query("UPDATE accounts SET status='active' WHERE account_id=? AND status='pending'",[Number(req.params.id)]);
+   await audit(req.account.account_id,"account_approved",`Approved account ${req.params.id}`,c);
+  });
+  res.status(204).end();
+ }catch(e){next(e);}
+});
 app.post("/api/approvals/:id/reject",requireAuth,requireSuperadmin,async(req,res,next)=>{try{await pool.query("UPDATE accounts SET status='rejected' WHERE account_id=? AND status='pending'",[Number(req.params.id)]);await audit(req.account.account_id,"account_rejected",`Rejected account ${req.params.id}`);res.status(204).end();}catch(e){next(e);}});
 
 async function collectionData(name){

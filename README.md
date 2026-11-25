@@ -125,6 +125,11 @@ can enter or update them from User Management. Street, barangay, and city must
 all be provided together. Existing user address records are returned with the
 profile and displayed in the user details and profile pages.
 
+Creating a BFAR Admin through User Management requires confirmation. In the
+same transaction, any existing active BFAR Admin accounts are disabled before
+the new account is created. Disabled BFAR Admin accounts are retained, omitted
+from the User Management list, and cannot sign in.
+
 For a **new empty MySQL database**, run `schema.sql` first and then `seed_data.sql` against
 the same database. The application creates missing schema tables at startup, but deliberately
 does not automatically import demo seed rows into a live database. Do not run the seed repeatedly
