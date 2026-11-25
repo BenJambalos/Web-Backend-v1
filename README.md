@@ -129,6 +129,13 @@ Creating a BFAR Admin through User Management requires confirmation. In the
 same transaction, any existing active BFAR Admin accounts are disabled before
 the new account is created. Disabled BFAR Admin accounts are retained, omitted
 from the User Management list, and cannot sign in.
+Only accounts disabled by this replacement flow are eligible for automatic
+deletion: a cleanup runs at startup and daily, deleting them after 30 days if
+they have not been reactivated. Superadmins can reactivate an eligible account
+from the Previous Admins list; this disables any currently active BFAR Admin
+and clears the selected account's deletion deadline. Deleting an account
+cascades to its linked profile, addresses, reset tokens, and account activity
+logs.
 
 For a **new empty MySQL database**, run `schema.sql` first and then `seed_data.sql` against
 the same database. The application creates missing schema tables at startup, but deliberately

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import app from "./app.js";
 import { pool, initializeDatabase, runSqlFile } from "./db.js";
+import { purgeExpiredReplacedBfarAdmins } from "./adminAccounts.js";
 
 const port = Number(process.env.PORT || 3000);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,6 +16,26 @@ await initializeDatabase();
 // Apply the idempotent ML migration so existing databases gain the new ML
 // result table and forecast/notification columns required by the API.
 await runSqlFile(path.join(path.dirname(fileURLToPath(import.meta.url)), "migrations", "004_ml_results.sql"));
+
+const replacementCleanupTimer = setInterval(async () => {
+  try {
+    const result = await purgeExpiredReplacedBfarAdmins(pool);
+    if (result.rowCount > 0) {
+      console.info(`Deleted ${result.rowCount} expired replaced BFAR Admin account(s).`);
+    }
+  } catch (error) {
+    console.error("Unable to purge expired replaced BFAR Admin accounts:", error);
+  }
+}, 24 * 60 * 60 * 1000);
+replacementCleanupTimer.unref();
+try {
+  const result = await purgeExpiredReplacedBfarAdmins(pool);
+  if (result.rowCount > 0) {
+    console.info(`Deleted ${result.rowCount} expired replaced BFAR Admin account(s).`);
+  }
+} catch (error) {
+  console.error("Unable to purge expired replaced BFAR Admin accounts:", error);
+}
 
 const distPath = path.join(root, "frontend", "dist");
 if (existsSync(distPath)) {
@@ -31,6 +52,7 @@ const server = app.listen(port, "0.0.0.0", () => {
 
 
 async function shutdown() {
+  clearInterval(replacementCleanupTimer);
   server.close(async () => {
     await pool.end();
     process.exit(0);

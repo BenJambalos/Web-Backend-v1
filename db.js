@@ -103,6 +103,15 @@ export async function initializeDatabase() {
       "ALTER TABLE accounts ADD COLUMN last_seen DATETIME DEFAULT NULL AFTER status_before_archive",
     );
   }
+
+  const [replacementDisabledColumns] = await connectionPool.query(
+    "SHOW COLUMNS FROM accounts LIKE 'replacement_disabled_at'",
+  );
+  if (replacementDisabledColumns.length === 0) {
+    await connectionPool.query(
+      "ALTER TABLE accounts ADD COLUMN replacement_disabled_at DATETIME DEFAULT NULL AFTER last_seen",
+    );
+  }
 }
 
 export async function runSqlFile(filePath) {
