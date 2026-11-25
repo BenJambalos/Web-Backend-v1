@@ -10,8 +10,6 @@ import { pool, withTransaction } from "./db.js";
 import {
   assertBfarAdminActivationAvailable,
   disableActiveBfarAdmins,
-  getReactivatableBfarAdmins,
-  reactivateReplacedBfarAdmin,
 } from "./adminAccounts.js";
 import { sendPasswordResetEmail } from "./mail.js";
 import { createPasswordResetUrl } from "./passwordResetUrl.js";
@@ -273,15 +271,6 @@ app.get("/api/users",requireAuth,requireSuperadmin,async(_req,res,next)=>{
   res.json(rows.map(r=>makeUser(r,camelProfile(r))));
  }catch(e){next(e);}
 });
-app.get("/api/users/replaced-admins",requireAuth,requireSuperadmin,async(_req,res,next)=>{
- try{
-  const rows=await getReactivatableBfarAdmins(pool);
-  res.json(rows.map(r=>({
-   ...makeUser(r,camelProfile(r)),
-   reactivationExpiresAt:r.reactivation_expires_at,
-  })));
- }catch(e){next(e);}
-});
 app.post("/api/users",requireAuth,requireSuperadmin,async(req,res,next)=>{
  try{
   const username=String(req.body.username||req.body.email||"").trim().toLowerCase(), email=normalizeEmail(req.body.email);
@@ -304,18 +293,6 @@ app.post("/api/users",requireAuth,requireSuperadmin,async(req,res,next)=>{
    return a.insertId;
   });
   res.status(201).json({id:String(id)});
- }catch(e){next(e);}
-});
-app.post("/api/users/:id/reactivate",requireAuth,requireSuperadmin,async(req,res,next)=>{
- try{
-  await withTransaction(async c=>{
-   await reactivateReplacedBfarAdmin(c,{
-    actorAccountId:req.account.account_id,
-    targetAccountId:Number(req.params.id),
-    audit,
-   });
-  });
-  res.status(204).end();
  }catch(e){next(e);}
 });
 app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
@@ -359,7 +336,7 @@ app.patch("/api/users/:id",requireAuth,async(req,res,next)=>{
      await c.query("UPDATE accounts SET status=COALESCE(status_before_archive,'active'),status_before_archive=NULL WHERE account_id=? AND status='archived'",[id]);
     }else if(req.body.status){
      const nextStatus=map[req.body.status]||req.body.status;
-     await c.query("UPDATE accounts SET status=?,replacement_disabled_at=IF(?='active',NULL,replacement_disabled_at) WHERE account_id=?",[nextStatus,nextStatus,id]);
+     await c.query("UPDATE accounts SET status=? WHERE account_id=?",[nextStatus,id]);
     }
     if(req.body.role!==undefined){
      const roles={"Farm Owner":"farm_owner","BFAR Admin":"admin","Superadmin":"super_admin"};
@@ -404,7 +381,7 @@ app.post("/api/approvals/:id/approve",requireAuth,requireSuperadmin,async(req,re
     actorAccountId:req.account.account_id,
     targetAccountId:Number(req.params.id),
    });
-   await c.query("UPDATE accounts SET status='active',replacement_disabled_at=NULL WHERE account_id=? AND status='pending'",[Number(req.params.id)]);
+   await c.query("UPDATE accounts SET status='active' WHERE account_id=? AND status='pending'",[Number(req.params.id)]);
    await audit(req.account.account_id,"account_approved",`Approved account ${req.params.id}`,c);
   });
   res.status(204).end();

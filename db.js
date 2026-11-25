@@ -104,14 +104,6 @@ export async function initializeDatabase() {
     );
   }
 
-  const [replacementDisabledColumns] = await connectionPool.query(
-    "SHOW COLUMNS FROM accounts LIKE 'replacement_disabled_at'",
-  );
-  if (replacementDisabledColumns.length === 0) {
-    await connectionPool.query(
-      "ALTER TABLE accounts ADD COLUMN replacement_disabled_at DATETIME DEFAULT NULL AFTER last_seen",
-    );
-  }
 }
 
 export async function runSqlFile(filePath) {

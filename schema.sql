@@ -64,7 +64,6 @@ CREATE TABLE IF NOT EXISTS accounts (
   status         ENUM('active', 'inactive', 'disabled', 'suspended', 'pending', 'rejected', 'archived') NOT NULL DEFAULT 'pending', -- CORRECTION 7
   status_before_archive VARCHAR(32) DEFAULT NULL,
   last_seen      DATETIME DEFAULT NULL,
-  replacement_disabled_at DATETIME DEFAULT NULL,
   created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY username (username)

@@ -42,9 +42,7 @@ export async function disableActiveBfarAdmins(client, { actorAccountId, confirme
   }
   if (activeAdmins.length === 0) return;
 
-  await client.query(
-    "UPDATE accounts SET status='disabled', replacement_disabled_at=NOW() WHERE role='admin' AND status='active'",
-  );
+  await client.query("UPDATE accounts SET status='disabled' WHERE role='admin' AND status='active'");
   await audit(
     actorAccountId,
     "admin_replaced",
@@ -53,54 +51,8 @@ export async function disableActiveBfarAdmins(client, { actorAccountId, confirme
   );
 }
 
-export async function getReactivatableBfarAdmins(client) {
-  const { rows } = await client.query(`SELECT a.account_id,a.username,a.role,a.status,a.last_seen,
-    a.replacement_disabled_at,DATE_ADD(a.replacement_disabled_at,INTERVAL 30 DAY) AS reactivation_expires_at,
-    p.first_name,p.middle_name,p.last_name,p.email,p.phone
-    FROM accounts a JOIN user_profiles p ON p.account_id=a.account_id
-    WHERE a.role='admin' AND a.status='disabled'
-      AND a.replacement_disabled_at>DATE_SUB(NOW(),INTERVAL 30 DAY)
-    ORDER BY a.replacement_disabled_at DESC`);
-  return rows;
-}
-
-export async function reactivateReplacedBfarAdmin(client, {
-  actorAccountId,
-  targetAccountId,
-  audit,
-}) {
-  await lockActiveSuperadmins(client, actorAccountId);
-  const { rows } = await client.query(`SELECT account_id,role,status,replacement_disabled_at,
-    replacement_disabled_at>DATE_SUB(NOW(),INTERVAL 30 DAY) AS is_reactivatable
-    FROM accounts WHERE account_id=? FOR UPDATE`, [targetAccountId]);
-  const target = rows[0];
-  if (!target || target.role !== "admin" || target.status !== "disabled" || !target.replacement_disabled_at) {
-    throw httpError(404, "This replaced BFAR Admin account is no longer available.");
-  }
-  if (!target.is_reactivatable) {
-    throw httpError(410, "The reactivation window for this BFAR Admin account has expired.");
-  }
-
-  await disableActiveBfarAdmins(client, {
-    actorAccountId,
-    confirmed: true,
-    audit,
-  });
-  await client.query(
-    "UPDATE accounts SET status='active',replacement_disabled_at=NULL WHERE account_id=?",
-    [targetAccountId],
-  );
-  await audit(
-    actorAccountId,
-    "admin_reactivated",
-    `Reactivated replaced BFAR Admin account #${targetAccountId}.`,
-    client,
-  );
-}
-
 export async function purgeExpiredReplacedBfarAdmins(client) {
   return client.query(`DELETE FROM accounts
     WHERE role='admin' AND status='disabled'
-      AND replacement_disabled_at IS NOT NULL
-      AND replacement_disabled_at<=DATE_SUB(NOW(),INTERVAL 30 DAY)`);
+      AND updated_at<=DATE_SUB(NOW(),INTERVAL 30 DAY)`);
 }
