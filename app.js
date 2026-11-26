@@ -25,6 +25,12 @@ const allowedOrigins = (
 const app = express();
 const COOKIE = "hyqual_session";
 const TTL = 12 * 60 * 60 * 1000;
+const SESSION_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+  path: "/",
+};
 const PRESENCE_TIMEOUT_SECONDS = 90;
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
@@ -200,12 +206,12 @@ app.post("/api/auth/login", loginLimiter, async (req,res,next)=>{
       await pool.query("UPDATE accounts SET last_seen=NOW() WHERE account_id=?",[row.account_id]);
     }
     await audit(row.account_id,"login","Signed in to HyQual website.");
-    res.cookie(COOKIE,signSession(row.account_id,Date.now()+TTL),{httpOnly:true,secure:process.env.NODE_ENV==="production",sameSite:"lax",path:"/",maxAge:TTL});
+    res.cookie(COOKIE,signSession(row.account_id,Date.now()+TTL),{...SESSION_COOKIE_OPTIONS,maxAge:TTL});
     res.json({user:makeUser(row,camelProfile(row))});
   }catch(e){next(e);}
 });
 app.get("/api/auth/me",requireAuth,(req,res)=>res.json({user:req.user}));
-app.post("/api/auth/logout",async(req,res)=>{res.clearCookie(COOKIE,{httpOnly:true,secure:process.env.NODE_ENV==="production",sameSite:"lax",path:"/"});res.status(204).end();});
+app.post("/api/auth/logout",async(req,res)=>{res.clearCookie(COOKIE,SESSION_COOKIE_OPTIONS);res.status(204).end();});
 app.post("/api/auth/register",async(req,res,next)=>{
   try {
     const username=String(req.body.username||req.body.email||"").trim().toLowerCase();
